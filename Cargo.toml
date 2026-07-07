@@ -1,6 +1,6 @@
 [package]
 name = "vyges-cdc"
-version = "0.1.8"
+version = "0.1.10"
 edition = "2021"
 description = "Structural clock-domain-crossing (CDC) checker: netlist + clocks in, crossings out."
 license = "Apache-2.0"
