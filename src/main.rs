@@ -81,6 +81,34 @@ fn render_json(r: &CdcReport) -> String {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--describe") {
+        // Machine-readable description of `check` for tooling that drives it.
+        const DESCRIBE: &str = r#"{
+  "name": "cdc",
+  "summary": "structural clock-domain-crossing check",
+  "invocation": {
+    "args_template": ["check", "{netlist}", "--lib", "{lib}", "--sdc", "{sdc}"],
+    "optional": [
+      { "arg": "out", "flag": "-o" }
+    ],
+    "emits_json": true
+  },
+  "inputs": {
+    "type": "object",
+    "required": ["netlist", "lib", "sdc"],
+    "properties": {
+      "netlist": { "type": "string", "description": "gate-level netlist to analyze" },
+      "lib": { "type": "string", "description": "Liberty file identifying flops and clock/data pins" },
+      "sdc": { "type": "string", "description": "SDC file defining clock domains" },
+      "out": { "type": "string", "description": "write the report to this file instead of stdout" }
+    }
+  },
+  "artifacts": []
+}
+"#;
+        print!("{DESCRIBE}");
+        return;
+    }
     if args.iter().any(|a| a == "-h" || a == "--help") || args.is_empty() {
         print!("{USAGE}");
         return;
