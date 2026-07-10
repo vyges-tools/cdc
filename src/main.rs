@@ -103,7 +103,7 @@ fn main() {
       "out": { "type": "string", "description": "write the report to this file instead of stdout" }
     }
   },
-  "artifacts": []
+  "artifacts": [ { "role": "cdc_report", "from_arg": "out" } ]
 }
 "#;
         print!("{DESCRIBE}");
