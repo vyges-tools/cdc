@@ -80,6 +80,55 @@ fn render_json(r: &CdcReport) -> String {
     s
 }
 
+/// Emit the vyges-events causal trail — one event per unsynchronized crossing + a
+/// completion event. Written to stderr (the default sink) so it never mixes with the
+/// report (stdout / -o). `code` (CDC-<KIND>) is the clustering key; `objects` (the
+/// launch/capture nets and their clock domains) are the cross-stage co-ref keys.
+fn emit_cdc_events(r: &CdcReport) {
+    use vyges_events::{emit, Event, Severity};
+    let mut viols = 0usize;
+    for c in &r.crossings {
+        if c.synchronized {
+            continue; // a clean 2-flop synchronizer is not a violation
+        }
+        viols += 1;
+        let kind = if c.through_logic { "LOGIC" } else { "UNSYNC" };
+        let detail = if c.through_logic {
+            "combinational logic on clock-domain-crossing path"
+        } else {
+            "no synchronizer on clock-domain crossing"
+        };
+        emit(
+            &Event::new(
+                "vyges-cdc",
+                Severity::Warn,
+                format!(
+                    "{}: {} [{}] -> {} [{}]",
+                    detail, c.from_flop, c.from_domain, c.to_flop, c.to_domain
+                ),
+            )
+            .with_code(format!("CDC-{kind}"))
+            .with_objects(vec![
+                format!("net:{}", c.from_flop),
+                format!("net:{}", c.to_flop),
+                format!("clock:{}", c.from_domain),
+                format!("clock:{}", c.to_domain),
+            ]),
+        );
+    }
+    emit(
+        &Event::new(
+            "vyges-cdc",
+            if viols == 0 { Severity::Info } else { Severity::Warn },
+            format!(
+                "cdc check complete: {} crossing(s), {viols} unsynchronized",
+                r.crossings.len()
+            ),
+        )
+        .with_code("CDC-DONE"),
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--describe") {
@@ -136,6 +185,7 @@ fn main() {
     let sdc = Sdc::load(&sdcp).unwrap_or_else(|e| die(&format!("{sdcp}: {e}")));
 
     let report = cdc::analyze(&nl, &lib, &sdc).unwrap_or_else(|e| die(&e));
+    emit_cdc_events(&report);
     let json = args.iter().any(|a| a == "--json");
     let text = if json { render_json(&report) } else { render_text(&report) };
     match opt(&args, "-o") {

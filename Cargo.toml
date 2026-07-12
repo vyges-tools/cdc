@@ -11,6 +11,9 @@ repository = "https://github.com/vyges-tools/cdc"
 # Parsers (netlist / Liberty / SDC) come from the vyges-loom foundation.
 [dependencies]
 vyges-loom = { git = "https://github.com/vyges-tools/loom", branch = "main" }
+# Structured events (vyges-events/1.0) for the MCP causal trail. Core-only (no tracing
+# backend) so the emit is a plain stderr write that never mixes with the report.
+vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main", default-features = false }
 
 [[bin]]
 name = "vyges-cdc"
