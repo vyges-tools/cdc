@@ -160,6 +160,11 @@ fn main() {
         const DESCRIBE: &str = r#"{
   "name": "cdc",
   "summary": "structural clock-domain-crossing check",
+  "maturity": "structured",
+  "provenance_limitations": [
+      "input_hash covers the argument vector, not the content of the netlist, Liberty or SDC it names.",
+      "Liberty `include` files are not enumerated."
+  ],
   "invocation": {
     "args_template": ["check", "{netlist}", "--lib", "{lib}", "--sdc", "{sdc}"],
     "optional": [
