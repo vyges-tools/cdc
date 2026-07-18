@@ -135,6 +135,24 @@ fn emit_cdc_events(r: &CdcReport) {
     );
 }
 
+/// Add `"report_path"` to a `--json` payload so the result says where its report landed.
+///
+/// String surgery rather than a JSON round-trip because this crate is std-only. Inserting
+/// after the opening brace keeps every existing field untouched; an empty object gets no
+/// trailing comma.
+fn with_report_path(json: &str, path: Option<&str>) -> String {
+    let (Some(p), Some(rest)) = (path, json.trim_start().strip_prefix('{')) else {
+        return json.to_string();
+    };
+    let esc = p.replace('\\', "\\\\").replace('"', "\\\"");
+    let sep = if rest.trim_start().starts_with('}') {
+        ""
+    } else {
+        ","
+    };
+    format!("{{\"report_path\": \"{esc}\"{sep}{rest}")
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--describe") {
@@ -159,7 +177,7 @@ fn main() {
       "out": { "type": "string", "description": "write the report to this file instead of stdout" }
     }
   },
-  "artifacts": [ { "role": "cdc_report", "from_arg": "out" } ],
+  "artifacts": [ { "role": "cdc_report", "field": "report_path" } ],
   "assertion": {
     "id": "cdc-synchronized",
     "field": "unsynchronized",
@@ -199,7 +217,7 @@ fn main() {
     emit_cdc_events(&report);
     let json = args.iter().any(|a| a == "--json");
     let text = if json {
-        render_json(&report)
+        with_report_path(&render_json(&report), opt(&args, "-o").as_deref())
     } else {
         render_text(&report)
     };
@@ -207,6 +225,12 @@ fn main() {
         Some(p) => {
             if let Err(e) = std::fs::write(&p, &text) {
                 die(&format!("{p}: {e}"));
+            }
+            eprintln!("wrote {p}");
+            // `-o` writes the report; the machine payload still goes to stdout, so asking
+            // for the file does not cost the caller the parsed result.
+            if json {
+                print!("{text}");
             }
         }
         None => print!("{text}"),
