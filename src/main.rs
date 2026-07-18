@@ -28,7 +28,9 @@ flags:
 ";
 
 fn opt(args: &[String], name: &str) -> Option<String> {
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1).cloned())
 }
 
 fn render_text(r: &CdcReport) -> String {
@@ -119,7 +121,11 @@ fn emit_cdc_events(r: &CdcReport) {
     emit(
         &Event::new(
             "vyges-cdc",
-            if viols == 0 { Severity::Info } else { Severity::Warn },
+            if viols == 0 {
+                Severity::Info
+            } else {
+                Severity::Warn
+            },
             format!(
                 "cdc check complete: {} crossing(s), {viols} unsynchronized",
                 r.crossings.len()
@@ -153,7 +159,12 @@ fn main() {
       "out": { "type": "string", "description": "write the report to this file instead of stdout" }
     }
   },
-  "artifacts": [ { "role": "cdc_report", "from_arg": "out" } ]
+  "artifacts": [ { "role": "cdc_report", "from_arg": "out" } ],
+  "assertion": {
+    "id": "cdc-synchronized",
+    "field": "unsynchronized",
+    "pass_when": { "eq": 0 }
+  }
 }
 "#;
         print!("{DESCRIBE}");
@@ -187,7 +198,11 @@ fn main() {
     let report = cdc::analyze(&nl, &lib, &sdc).unwrap_or_else(|e| die(&e));
     emit_cdc_events(&report);
     let json = args.iter().any(|a| a == "--json");
-    let text = if json { render_json(&report) } else { render_text(&report) };
+    let text = if json {
+        render_json(&report)
+    } else {
+        render_text(&report)
+    };
     match opt(&args, "-o") {
         Some(p) => {
             if let Err(e) = std::fs::write(&p, &text) {

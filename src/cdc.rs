@@ -38,11 +38,18 @@ struct Driver {
 }
 
 fn is_in(lib: &Lib, cell: &str, pin: &str) -> bool {
-    lib.cells.get(cell).and_then(|c| c.pins.get(pin)).map(|p| p.direction) == Some(Dir::In)
+    lib.cells
+        .get(cell)
+        .and_then(|c| c.pins.get(pin))
+        .map(|p| p.direction)
+        == Some(Dir::In)
 }
 
 fn net_of<'a>(inst: &'a Inst, pin: &str) -> Option<&'a str> {
-    inst.conns.iter().find(|(p, _)| p == pin).map(|(_, n)| n.as_str())
+    inst.conns
+        .iter()
+        .find(|(p, _)| p == pin)
+        .map(|(_, n)| n.as_str())
 }
 
 /// `(clock_pin, data_pins, q_pins)` for a sequential cell, else `None`.
@@ -58,7 +65,12 @@ fn flop_pins(lib: &Lib, cell: &str) -> Option<(String, Vec<String>, Vec<String>)
         .filter(|(_, p)| !p.setup.is_empty() || !p.hold.is_empty())
         .map(|(n, _)| n.clone())
         .collect();
-    let q = c.pins.iter().filter(|(_, p)| p.direction == Dir::Out).map(|(n, _)| n.clone()).collect();
+    let q = c
+        .pins
+        .iter()
+        .filter(|(_, p)| p.direction == Dir::Out)
+        .map(|(n, _)| n.clone())
+        .collect();
     Some((clk, d, q))
 }
 
@@ -136,13 +148,27 @@ pub fn analyze(nl: &Netlist, lib: &Lib, sdc: &Sdc) -> Result<CdcReport, String> 
     // net -> driver
     let mut nd: BTreeMap<String, Driver> = BTreeMap::new();
     for inp in &nl.inputs {
-        nd.insert(inp.clone(), Driver { inst: None, is_seq: false });
+        nd.insert(
+            inp.clone(),
+            Driver {
+                inst: None,
+                is_seq: false,
+            },
+        );
     }
     for (i, inst) in nl.insts.iter().enumerate() {
-        let Some(cell) = lib.cells.get(&inst.cell) else { continue };
+        let Some(cell) = lib.cells.get(&inst.cell) else {
+            continue;
+        };
         for (pin, net) in &inst.conns {
             if cell.pins.get(pin).map(|p| p.direction) == Some(Dir::Out) {
-                nd.insert(net.clone(), Driver { inst: Some(i), is_seq: cell.is_seq });
+                nd.insert(
+                    net.clone(),
+                    Driver {
+                        inst: Some(i),
+                        is_seq: cell.is_seq,
+                    },
+                );
             }
         }
     }
@@ -162,15 +188,21 @@ pub fn analyze(nl: &Netlist, lib: &Lib, sdc: &Sdc) -> Result<CdcReport, String> 
     // crossings: for each capture flop, walk its D cone to launch flops
     let mut crossings = Vec::new();
     for inst in &nl.insts {
-        let Some((_, dpins, _)) = flop_pins(lib, &inst.cell) else { continue };
-        let Some(dc) = flop_domain.get(&inst.name) else { continue };
+        let Some((_, dpins, _)) = flop_pins(lib, &inst.cell) else {
+            continue;
+        };
+        let Some(dc) = flop_domain.get(&inst.name) else {
+            continue;
+        };
         for d in &dpins {
             let Some(dn) = net_of(inst, d) else { continue };
             let mut launches = Vec::new();
             launch_flops(dn, true, &nd, nl, lib, &mut BTreeSet::new(), &mut launches);
             for (li, direct) in launches {
                 let lname = &nl.insts[li].name;
-                let Some(dl) = flop_domain.get(lname) else { continue };
+                let Some(dl) = flop_domain.get(lname) else {
+                    continue;
+                };
                 if dl == dc {
                     continue; // same domain, not a crossing
                 }
@@ -190,7 +222,11 @@ pub fn analyze(nl: &Netlist, lib: &Lib, sdc: &Sdc) -> Result<CdcReport, String> 
     let mut domains: Vec<String> = sdc.clocks.iter().map(|c| c.name.clone()).collect();
     domains.sort();
     domains.dedup();
-    Ok(CdcReport { crossings, flop_domain, domains })
+    Ok(CdcReport {
+        crossings,
+        flop_domain,
+        domains,
+    })
 }
 
 /// Is the capture flop the first stage of a 2-flop synchronizer? — does its Q
@@ -203,14 +239,18 @@ fn has_second_stage(
     nd: &BTreeMap<String, Driver>,
     flop_domain: &BTreeMap<String, String>,
 ) -> bool {
-    let Some((_, _, qpins)) = flop_pins(lib, &cap.cell) else { return false };
+    let Some((_, _, qpins)) = flop_pins(lib, &cap.cell) else {
+        return false;
+    };
     for q in &qpins {
         let Some(qn) = net_of(cap, q) else { continue };
         for s2 in &nl.insts {
             if flop_domain.get(&s2.name).map(String::as_str) != Some(domain) {
                 continue;
             }
-            let Some((_, d2pins, _)) = flop_pins(lib, &s2.cell) else { continue };
+            let Some((_, d2pins, _)) = flop_pins(lib, &s2.cell) else {
+                continue;
+            };
             for d2 in &d2pins {
                 if net_of(s2, d2) == Some(qn) {
                     // d2 is on cap's Q net; confirm cap.Q is its *direct* driver
@@ -250,7 +290,10 @@ mod tests {
         assert_eq!(r.flop_domain.get("b"), Some(&"clk2".to_string()));
         let c: Vec<_> = r.crossings.iter().filter(|c| c.to_flop == "b").collect();
         assert_eq!(c.len(), 1);
-        assert_eq!((c[0].from_domain.as_str(), c[0].to_domain.as_str()), ("clk1", "clk2"));
+        assert_eq!(
+            (c[0].from_domain.as_str(), c[0].to_domain.as_str()),
+            ("clk1", "clk2")
+        );
         assert!(!c[0].synchronized, "single flop -> not synchronized");
     }
 
@@ -264,7 +307,11 @@ mod tests {
         )
         .unwrap();
         let r = analyze(&nl, &lib(), &sdc()).unwrap();
-        let c: Vec<_> = r.crossings.iter().filter(|c| c.from_flop == "a" && c.to_flop == "s1").collect();
+        let c: Vec<_> = r
+            .crossings
+            .iter()
+            .filter(|c| c.from_flop == "a" && c.to_flop == "s1")
+            .collect();
         assert_eq!(c.len(), 1, "the clk1->clk2 crossing into s1");
         assert!(c[0].synchronized, "s1+s2 is a 2-flop synchronizer");
         assert!(!c[0].through_logic);
