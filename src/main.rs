@@ -9,17 +9,24 @@
 use std::process::exit;
 
 use vyges_cdc::cdc::{self, CdcReport};
+use vyges_cdc::rdc;
 use vyges_cdc::{liberty::Lib, netlist, sdc::Sdc};
 
 const USAGE: &str = "\
-vyges-cdc — structural clock-domain-crossing check
+vyges-cdc — structural clock- and reset-domain-crossing checks
 
 usage:
   vyges-cdc check NETLIST --lib L.lib --sdc S.sdc [-o OUT] [--json] [--fail-on-violation]
+  vyges-cdc rdc   NETLIST --lib L.lib           [-o OUT] [--json] [--fail-on-violation]
+
+`check` finds CLOCK-domain crossings; `rdc` finds RESET-domain crossings — a flop
+asynchronously reset by one reset feeding a flop reset by another. A single-clock design is
+CDC-clean by construction and can still fail `rdc`, so they are separate reports. `rdc` needs
+no SDC: reset domains are structural, traced from the Liberty ff group's clear/preset pins.
 
 flags:
-  --lib FILE            Liberty (identifies flops + clock/data pins) — required
-  --sdc FILE            SDC clock definitions (the domains) — required
+  --lib FILE            Liberty (identifies flops + clock/data/reset pins) — required
+  --sdc FILE            SDC clock definitions (the domains) — required by `check`
   -o FILE               write the report to FILE (default: stdout)
   --json                machine-readable JSON instead of text
   --fail-on-violation   exit 3 if any unsynchronized crossing is found (CI gate)
@@ -60,6 +67,111 @@ fn render_text(r: &CdcReport) -> String {
         ));
     }
     s
+}
+
+fn render_rdc_text(r: &rdc::RdcReport) -> String {
+    let mut s = String::new();
+    let unsync = r.crossings.iter().filter(|c| !c.synchronized).count();
+    s.push_str(&format!(
+        "vyges-cdc (rdc) — {} reset domain(s), {} crossing(s), {} unsynchronized \
+         ({} flop(s) with no async reset)\n",
+        r.domains.len(),
+        r.crossings.len(),
+        unsync,
+        r.unreset_flops
+    ));
+    if r.crossings.is_empty() {
+        s.push_str("  no reset-domain crossings.\n");
+        return s;
+    }
+    for c in r.crossings.iter().take(200) {
+        let tag = if c.synchronized {
+            "OK   (2-flop sync)"
+        } else if c.through_logic {
+            "VIOL (logic on RDC path)"
+        } else {
+            "VIOL (no synchronizer)"
+        };
+        s.push_str(&format!(
+            "  {} [{}] → {} [{}]   {}\n",
+            c.from_flop, c.from_domain, c.to_flop, c.to_domain, tag
+        ));
+    }
+    s
+}
+
+fn render_rdc_json(r: &rdc::RdcReport) -> String {
+    let mut s = String::from("{\n");
+    s.push_str(&format!("  \"reset_domains\": {},\n", r.domains.len()));
+    s.push_str(&format!("  \"crossings\": {},\n", r.crossings.len()));
+    s.push_str(&format!("  \"unreset_flops\": {},\n", r.unreset_flops));
+    s.push_str(&format!(
+        "  \"unsynchronized\": {},\n",
+        r.crossings.iter().filter(|c| !c.synchronized).count()
+    ));
+    s.push_str("  \"items\": [\n");
+    for (i, c) in r.crossings.iter().enumerate() {
+        let comma = if i + 1 < r.crossings.len() { "," } else { "" };
+        s.push_str(&format!(
+            "    {{\"from\": \"{}\", \"to\": \"{}\", \"from_domain\": \"{}\", \"to_domain\": \"{}\", \"synchronized\": {}, \"through_logic\": {}}}{}\n",
+            c.from_flop, c.to_flop, c.from_domain, c.to_domain, c.synchronized, c.through_logic, comma
+        ));
+    }
+    s.push_str("  ]\n}\n");
+    s
+}
+
+/// The causal trail for a reset-domain run. Same shape as the CDC one — `RDC-<KIND>` is the
+/// clustering key, the flops and their reset domains are the co-ref keys.
+fn emit_rdc_events(r: &rdc::RdcReport) {
+    use vyges_events::{emit, Event, Severity};
+    let mut viols = 0usize;
+    for c in &r.crossings {
+        if c.synchronized {
+            continue;
+        }
+        viols += 1;
+        let kind = if c.through_logic { "LOGIC" } else { "UNSYNC" };
+        let detail = if c.through_logic {
+            "combinational logic on reset-domain-crossing path"
+        } else {
+            "reset-domain crossing with no synchronizer"
+        };
+        emit(
+            &Event::new(
+                "vyges-cdc",
+                Severity::Warn,
+                format!(
+                    "{}: {} [{}] → {} [{}]",
+                    detail, c.from_flop, c.from_domain, c.to_flop, c.to_domain
+                ),
+            )
+            .with_code(&format!("RDC-{kind}"))
+            .with_objects(vec![
+                format!("flop:{}", c.from_flop),
+                format!("flop:{}", c.to_flop),
+                format!("reset:{}", c.from_domain),
+                format!("reset:{}", c.to_domain),
+            ]),
+        );
+    }
+    emit(
+        &Event::new(
+            "vyges-cdc",
+            if viols > 0 {
+                Severity::Warn
+            } else {
+                Severity::Info
+            },
+            format!(
+                "checked {} reset domain(s): {} crossing(s), {} unsynchronized",
+                r.domains.len(),
+                r.crossings.len(),
+                viols
+            ),
+        )
+        .with_code("RDC-DONE"),
+    );
 }
 
 fn render_json(r: &CdcReport) -> String {
@@ -201,30 +313,52 @@ fn main() {
         println!("vyges-cdc {}", vyges_cdc::VERSION);
         return;
     }
-    if args[0] != "check" {
+    if args[0] != "check" && args[0] != "rdc" {
         eprintln!("error: unknown command {:?}\n{USAGE}", args[0]);
         exit(2);
     }
+    let reset_mode = args[0] == "rdc";
     let Some(net) = args.get(1).filter(|a| !a.starts_with('-')) else {
         eprintln!("error: `check` needs a NETLIST path\n{USAGE}");
         exit(2);
     };
-    let (Some(libp), Some(sdcp)) = (opt(&args, "--lib"), opt(&args, "--sdc")) else {
-        eprintln!("error: `check` needs --lib and --sdc\n{USAGE}");
+    let Some(libp) = opt(&args, "--lib") else {
+        eprintln!("error: needs --lib\n{USAGE}");
         exit(2);
     };
+    // `rdc` takes no SDC: reset domains are structural, not declared. Accepting one and
+    // ignoring it would imply it changed the answer.
+    if !reset_mode && opt(&args, "--sdc").is_none() {
+        eprintln!("error: `check` needs --sdc\n{USAGE}");
+        exit(2);
+    }
 
     let nl = netlist::load(net).unwrap_or_else(|e| die(&format!("{net}: {e}")));
     let lib = Lib::load(&libp).unwrap_or_else(|e| die(&format!("{libp}: {e}")));
-    let sdc = Sdc::load(&sdcp).unwrap_or_else(|e| die(&format!("{sdcp}: {e}")));
 
-    let report = cdc::analyze(&nl, &lib, &sdc).unwrap_or_else(|e| die(&e));
-    emit_cdc_events(&report);
     let json = args.iter().any(|a| a == "--json");
-    let text = if json {
-        with_report_path(&render_json(&report), opt(&args, "-o").as_deref())
+    let (text, unsync) = if reset_mode {
+        let report = rdc::analyze(&nl, &lib).unwrap_or_else(|e| die(&e));
+        emit_rdc_events(&report);
+        let n = report.crossings.iter().filter(|c| !c.synchronized).count();
+        let t = if json {
+            with_report_path(&render_rdc_json(&report), opt(&args, "-o").as_deref())
+        } else {
+            render_rdc_text(&report)
+        };
+        (t, n)
     } else {
-        render_text(&report)
+        let sdcp = opt(&args, "--sdc").expect("checked above");
+        let sdc = Sdc::load(&sdcp).unwrap_or_else(|e| die(&format!("{sdcp}: {e}")));
+        let report = cdc::analyze(&nl, &lib, &sdc).unwrap_or_else(|e| die(&e));
+        emit_cdc_events(&report);
+        let n = report.crossings.iter().filter(|c| !c.synchronized).count();
+        let t = if json {
+            with_report_path(&render_json(&report), opt(&args, "-o").as_deref())
+        } else {
+            render_text(&report)
+        };
+        (t, n)
     };
     match opt(&args, "-o") {
         Some(p) => {
@@ -240,7 +374,6 @@ fn main() {
         }
         None => print!("{text}"),
     }
-    let unsync = report.crossings.iter().filter(|c| !c.synchronized).count();
     if args.iter().any(|a| a == "--fail-on-violation") && unsync > 0 {
         exit(3);
     }
