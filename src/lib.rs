@@ -14,12 +14,18 @@
 //! flop whose Q feeds a second same-domain flop). Reconvergence, gray-code/handshake
 //! recognition, and glitch/data-stability are the depth passes.
 //!
+//! **Reset**-domain crossings are the companion analysis, in [`rdc`]: the same traversal with
+//! the domain source changed from a declared clock to the net driving a flop's asynchronous
+//! reset. A design on a single clock is CDC-clean by construction and can still fail an RDC
+//! check, which is why it is a separate report rather than a mode.
+//!
 //! Reads the same Liberty / Verilog / SDC the rest of Loom does. Pure std beyond
 //! the shared parsers.
 
 pub use vyges_loom::{liberty, netlist, sdc};
 
 pub mod cdc;
+pub mod rdc;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const COPYRIGHT: &str = "© 2026 Vyges. All Rights Reserved.  https://vyges.com";
