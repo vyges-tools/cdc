@@ -52,6 +52,18 @@ Stated plainly, because the gap between this and a commercial RDC tool is real:
 - **One domain per flop.** A cell whose `clear` and `preset` come from different resets is
   rare and not modelled.
 
+### Validated on real netlists
+
+Run against **nine synthesised sky130 blocks** (5 901 flops), four of them OpenTitan-derived,
+at 0.05–0.25 s each. One design reported crossings between two independent top-level reset
+ports; the finding was verified by hand against the netlist. Two designs correctly reported
+**nothing to check** — one has no sequential cells, and one (a RISC-V core) resets
+synchronously throughout, so no flop carries an asynchronous reset at all.
+
+That last case is the one worth stating: a checker must be able to say *"I looked and there
+was nothing to look at"*, distinctly from *"I looked and it was clean"*. The report leads with
+the flop census for exactly that reason.
+
 Use it as an early structural lint that costs nothing to run in CI, not as RDC sign-off.
 
 ## Why this exists
