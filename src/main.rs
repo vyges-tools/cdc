@@ -73,15 +73,24 @@ fn render_rdc_text(r: &rdc::RdcReport) -> String {
     let mut s = String::new();
     let unsync = r.crossings.iter().filter(|c| !c.synchronized).count();
     s.push_str(&format!(
-        "vyges-cdc (rdc) — {} reset domain(s), {} crossing(s), {} unsynchronized \
-         ({} flop(s) with no async reset)\n",
+        "vyges-cdc (rdc) — {} flop(s) ({} async-reset, {} without), \
+         {} reset domain(s), {} crossing(s), {} unsynchronized\n",
+        r.seq_flops,
+        r.seq_flops - r.unreset_flops,
+        r.unreset_flops,
         r.domains.len(),
         r.crossings.len(),
-        unsync,
-        r.unreset_flops
+        unsync
     ));
     if r.crossings.is_empty() {
-        s.push_str("  no reset-domain crossings.\n");
+        // Say which kind of nothing this is. A design with no async-reset flops has nothing to
+        // check, and that must not read the same as a design that was checked and came back
+        // clean — a real crossbar netlist made exactly that mistake possible.
+        s.push_str(if r.seq_flops == r.unreset_flops {
+            "  nothing to check: no flop in this netlist has an asynchronous reset.\n"
+        } else {
+            "  no reset-domain crossings.\n"
+        });
         return s;
     }
     for c in r.crossings.iter().take(200) {
@@ -104,6 +113,7 @@ fn render_rdc_json(r: &rdc::RdcReport) -> String {
     let mut s = String::from("{\n");
     s.push_str(&format!("  \"reset_domains\": {},\n", r.domains.len()));
     s.push_str(&format!("  \"crossings\": {},\n", r.crossings.len()));
+    s.push_str(&format!("  \"flops\": {},\n", r.seq_flops));
     s.push_str(&format!("  \"unreset_flops\": {},\n", r.unreset_flops));
     s.push_str(&format!(
         "  \"unsynchronized\": {},\n",

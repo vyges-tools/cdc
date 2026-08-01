@@ -170,3 +170,28 @@ fn a_reset_synchronizer_output_is_its_own_domain() {
     );
     assert_eq!(r.crossings[0].to_domain, "rst_a_sync");
 }
+
+#[test]
+fn a_netlist_with_no_flops_is_reported_as_nothing_to_check() {
+    // Found by validating against a real TL-UL crossbar netlist: it has no sequential cells at
+    // all, and "0 crossings" read exactly like a clean result on a design full of them.
+    // `unreset_flops` does not catch this — zero flops scores zero there too.
+    let n = nl(" and2 g (.A(din), .B(din), .X(dout));\n");
+    let r = rdc::analyze(&n, &lib()).unwrap();
+    assert_eq!(r.seq_flops, 0, "there are genuinely no flops");
+    assert_eq!(r.unreset_flops, 0);
+    assert!(r.crossings.is_empty());
+}
+
+#[test]
+fn the_flop_census_distinguishes_checked_from_unexaminable() {
+    let n = nl("\
+ dfrtp a (.CLK(clk), .D(din), .RESET_B(rst_a), .Q(q1));\n\
+ dfxtp b (.CLK(clk), .D(q1), .Q(q2));\n\
+ dfxtp c (.CLK(clk), .D(q2), .Q(dout));\n");
+    let r = rdc::analyze(&n, &lib()).unwrap();
+    assert_eq!(r.seq_flops, 3, "all three are sequential");
+    assert_eq!(r.unreset_flops, 2, "two carry no async reset");
+    // 3 - 2 = 1 flop was actually eligible for reset-domain analysis, which is what the
+    // report must be able to say.
+}

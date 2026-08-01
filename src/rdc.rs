@@ -55,6 +55,13 @@ pub struct RdcReport {
     /// them — but the count is worth reporting so a clean run cannot be mistaken for a run
     /// that found nothing to look at.
     pub unreset_flops: usize,
+    /// Every sequential instance seen, reset-bearing or not.
+    ///
+    /// Validation against a real crossbar netlist showed why this is needed: it has **no flops
+    /// at all**, and "0 crossings" read exactly like a clean result on a design full of them.
+    /// `unreset_flops` does not catch that case — a design with zero flops scores zero there
+    /// too. A checker has to be able to say "I looked and there was nothing to look at".
+    pub seq_flops: usize,
 }
 
 struct Driver {
@@ -197,6 +204,7 @@ pub fn analyze(nl: &Netlist, lib: &Lib) -> Result<RdcReport, String> {
     // domain per flop: the origin of whatever drives its async reset pin
     let mut flop_domain: BTreeMap<String, String> = BTreeMap::new();
     let mut unreset_flops = 0usize;
+    let mut seq_flops = 0usize;
     for inst in &nl.insts {
         let Some(cell) = lib.cells.get(&inst.cell) else {
             continue;
@@ -204,6 +212,7 @@ pub fn analyze(nl: &Netlist, lib: &Lib) -> Result<RdcReport, String> {
         if !cell.is_seq {
             continue;
         }
+        seq_flops += 1;
         let mut dom = None;
         for rp in &cell.async_reset_pins {
             if let Some(rn) = net_of(inst, rp) {
@@ -262,6 +271,7 @@ pub fn analyze(nl: &Netlist, lib: &Lib) -> Result<RdcReport, String> {
         flop_domain,
         domains,
         unreset_flops,
+        seq_flops,
     })
 }
 
