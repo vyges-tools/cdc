@@ -4,6 +4,10 @@ Structural **clock-domain-crossing** check: a gate-level netlist, a Liberty, and
 the clock definitions in — the list of domain crossings out, each flagged
 synchronized or not.
 
+Also **reset**-domain crossings (`vyges-cdc rdc`) — a flop asynchronously reset by one reset
+feeding a flop reset by another. A single-clock design is CDC-clean by construction and can
+still fail that way, so it is a separate report rather than a mode.
+
 > **Vyges open EDA tools.** Commercial-grade silicon sign-off capability, built on
 > open standards and plain file formats — and meant to be accessible to everyone,
 > not only teams who can license a six-figure tool. `vyges-cdc` opens up CDC.
@@ -12,6 +16,43 @@ synchronized or not.
 > recognition are real and tested; reconvergence, gray-code/handshake recognition,
 > and data-stability are not yet covered (see **Current state**). Use it as an
 > early structural lint, not a sign-off CDC tool.
+
+## Reset-domain crossings (`rdc`)
+
+When two flops are reset by **different asynchronous resets**, and those resets deassert
+independently, the receiving flop can sample its input while the launching flop is still
+settling out of reset. That is the same metastability failure CDC exists to find, from a
+source no CDC check looks at — and it does not need two clocks.
+
+```sh
+vyges-cdc rdc netlist.v --lib sky130_fd_sc_hd__tt_025C_1v80.lib
+```
+
+No SDC. SDC has `create_clock`; it has no `create_reset`, so a reset domain is **structural**:
+the net driving a flop's asynchronous reset pin, traced back through buffers and inverters to
+whatever originates it — a primary input, or the output of a reset synchronizer. Two flops
+share a domain when they trace to the same origin. Which pins are asynchronous resets comes
+from the Liberty `ff` group's `clear`/`preset` expressions.
+
+A **synchronous** reset is deliberately not a reset domain: it arrives as data, is timed like
+any other path, and cannot cause a deassertion race. Counting it would report crossings
+throughout every design, and a checker that cries wolf is one nobody runs.
+
+### What `rdc` does not do
+
+Stated plainly, because the gap between this and a commercial RDC tool is real:
+
+- **It is gate-level.** Commercial RDC (e.g. Meridian RDC) runs on **RTL**, which is where the
+  designer fixes it and where the intent is still visible. Ours runs after synthesis.
+- **It does not prove protection.** A two-flop synchronizer is *recognized* structurally, the
+  same as in the CDC path. That is pattern recognition, not a formal argument.
+- **It does not analyse reset sequencing or ordering** — whether a destination is held in
+  reset while its source deasserts is exactly the kind of protection it cannot see, so a
+  reported crossing may be safe for a reason outside its view.
+- **One domain per flop.** A cell whose `clear` and `preset` come from different resets is
+  rare and not modelled.
+
+Use it as an early structural lint that costs nothing to run in CI, not as RDC sign-off.
 
 ## Why this exists
 
