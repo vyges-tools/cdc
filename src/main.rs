@@ -280,6 +280,7 @@ fn main() {
     if args.iter().any(|a| a == "--describe") {
         // Machine-readable description of `check` for tooling that drives it.
         const DESCRIBE: &str = r#"{
+  "schema": "vyges-tool-descriptor/1.1",
   "name": "cdc",
   "summary": "structural clock-domain-crossing check",
   "maturity": "structured",
