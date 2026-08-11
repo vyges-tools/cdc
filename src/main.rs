@@ -10,6 +10,7 @@ use std::process::exit;
 
 use vyges_cdc::cdc::{self, CdcReport};
 use vyges_cdc::rdc;
+use vyges_cdc::waive;
 use vyges_cdc::{liberty::Lib, netlist, sdc::Sdc};
 
 const USAGE: &str = "\
@@ -31,8 +32,12 @@ flags:
   --json                machine-readable JSON instead of text
   --fail-on-violation   exit 3 if any unsynchronized crossing is found (CI gate)
   --fail-on-multibit    exit 3 on a multi-bit crossing too. Opt-in, because a gray-coded
-                        or handshake-qualified bus looks identical here and there is no
-                        waiver mechanism yet to silence one
+                        or handshake-qualified bus looks identical here — waive the ones
+                        you have reviewed with --waivers
+  --waivers FILE        findings the team has accepted, each with a reason (and optionally
+                        an approver and an expiry). A lapsed waiver stops applying
+  --as-of YYYY-MM-DD    evaluate waiver expiry as of this date instead of today, so a
+                        sign-off run reproduces
   --describe            print a machine-readable JSON description of the command
   -h, --help · -V, --version
 ";
@@ -50,6 +55,109 @@ fn jlist(v: &[String]) -> String {
         .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The waiver section: what was accepted, and what about the waiver file needs attention.
+///
+/// Printed after the findings, never instead of them. A waived finding is one someone answered,
+/// and the answer is part of the report — a run whose output does not show what was waived
+/// cannot be reviewed, only trusted.
+fn render_waived(o: &waive::WaiveOutcome, set: &waive::WaiverSet) -> String {
+    let mut s = String::new();
+    if !o.waived.is_empty() {
+        s.push_str(&format!("\n  {} finding(s) waived:\n", o.waived.len()));
+        for w in o.waived.iter().take(50) {
+            s.push_str(&format!(
+                "    {}\n      reason: {} (waiver at line {})\n",
+                w.what, w.reason, w.waiver_line
+            ));
+        }
+        if o.waived.len() > 50 {
+            s.push_str(&format!("    … and {} more\n", o.waived.len() - 50));
+        }
+    }
+    if !o.lapsed.is_empty() {
+        s.push_str(&format!(
+            "  [warn] {} waiver(s) have LAPSED and were not applied — their findings are \
+             reported above:\n",
+            o.lapsed.len()
+        ));
+        for i in o.lapsed.iter().take(20) {
+            let w = &set.waivers[*i];
+            s.push_str(&format!(
+                "           line {}: expired {} — {}\n",
+                w.line,
+                w.expires.as_deref().unwrap_or("?"),
+                w.reason
+            ));
+        }
+    }
+    if !o.stale.is_empty() {
+        // A waiver matching nothing is a claim about a design that no longer exists. Left
+        // unreported it stays in the file forever, and the file stops being read.
+        s.push_str(&format!(
+            "  note: {} waiver(s) matched nothing (fixed, or the design moved):\n",
+            o.stale.len()
+        ));
+        for i in o.stale.iter().take(20) {
+            s.push_str(&format!("           line {}\n", set.waivers[*i].line));
+        }
+    }
+    if o.no_expiry > 0 {
+        s.push_str(&format!(
+            "  note: {} live waiver(s) carry no expiry date.\n",
+            o.no_expiry
+        ));
+    }
+    s
+}
+
+/// Waivers on the causal trail. A verdict reached by accepting findings is a different verdict
+/// from one reached without any, and whatever reads the trail has to be able to tell.
+fn emit_waive_events(o: &waive::WaiveOutcome, set: &waive::WaiverSet) {
+    use vyges_events::{emit, Event, Severity};
+    for w in &o.waived {
+        emit(
+            &Event::new(
+                "vyges-cdc",
+                Severity::Info,
+                format!(
+                    "waived: {} — {} (waiver line {})",
+                    w.what, w.reason, w.waiver_line
+                ),
+            )
+            .with_code("CDC-WAIVED"),
+        );
+    }
+    for i in &o.lapsed {
+        let w = &set.waivers[*i];
+        emit(
+            &Event::new(
+                "vyges-cdc",
+                Severity::Warn,
+                format!(
+                    "waiver at line {} expired {} and was not applied — {}",
+                    w.line,
+                    w.expires.as_deref().unwrap_or("?"),
+                    w.reason
+                ),
+            )
+            .with_code("CDC-WAIVER-LAPSED"),
+        );
+    }
+    for i in &o.stale {
+        emit(
+            &Event::new(
+                "vyges-cdc",
+                Severity::Info,
+                format!(
+                    "waiver at line {} matched nothing — the finding is gone or the design moved",
+                    set.waivers[*i].line
+                ),
+            )
+            .with_code("CDC-WAIVER-STALE"),
+        );
+    }
 }
 
 fn render_text(r: &CdcReport) -> String {
@@ -265,7 +373,7 @@ fn emit_rdc_events(r: &rdc::RdcReport) {
     );
 }
 
-fn render_json(r: &CdcReport) -> String {
+fn render_json(r: &CdcReport, o: &waive::WaiveOutcome) -> String {
     let mut s = String::from("{\n");
     s.push_str(&format!("  \"domains\": {},\n", r.domains.len()));
     s.push_str(&format!("  \"flops\": {},\n", r.flops_total));
@@ -283,6 +391,10 @@ fn render_json(r: &CdcReport) -> String {
         r.crossings.iter().filter(|c| !c.synchronized).count()
     ));
     s.push_str(&format!("  \"multibit\": {},\n", r.multibit.len()));
+    s.push_str(&format!("  \"waived\": {},\n", o.waived.len()));
+    s.push_str(&format!("  \"waivers_lapsed\": {},\n", o.lapsed.len()));
+    s.push_str(&format!("  \"waivers_stale\": {},\n", o.stale.len()));
+    s.push_str(&format!("  \"waivers_without_expiry\": {},\n", o.no_expiry));
     s.push_str("  \"multibit_items\": [\n");
     for (i, m) in r.multibit.iter().enumerate() {
         let comma = if i + 1 < r.multibit.len() { "," } else { "" };
@@ -510,26 +622,49 @@ fn main() {
     let lib = Lib::load(&libp).unwrap_or_else(|e| die(&format!("{libp}: {e}")));
 
     let json = args.iter().any(|a| a == "--json");
+    let waivers = match opt(&args, "--waivers") {
+        Some(p) => waive::WaiverSet::load(&p).unwrap_or_else(|e| die(&e.to_string())),
+        None => waive::WaiverSet::default(),
+    };
+    // Expiry makes the answer depend on the date, which a sign-off run cannot have. --as-of
+    // pins it so a result can be reproduced later exactly as it was reported.
+    let as_of = match opt(&args, "--as-of") {
+        Some(d) => waive::parse_date(&d)
+            .unwrap_or_else(|| die(&format!("--as-of must be YYYY-MM-DD, got {d:?}"))),
+        None => waive::today(),
+    };
     let (text, unsync, multibit) = if reset_mode {
-        let report = rdc::analyze(&nl, &lib).unwrap_or_else(|e| die(&e));
+        let mut report = rdc::analyze(&nl, &lib).unwrap_or_else(|e| die(&e));
+        let outcome = waive::apply_rdc(&mut report, &waivers, as_of);
         emit_rdc_events(&report);
+        emit_waive_events(&outcome, &waivers);
         let n = report.crossings.iter().filter(|c| !c.synchronized).count();
         let t = if json {
             with_report_path(&render_rdc_json(&report), opt(&args, "-o").as_deref())
         } else {
-            render_rdc_text(&report)
+            format!(
+                "{}{}",
+                render_rdc_text(&report),
+                render_waived(&outcome, &waivers)
+            )
         };
         (t, n, 0usize)
     } else {
         let sdcp = opt(&args, "--sdc").expect("checked above");
         let sdc = Sdc::load(&sdcp).unwrap_or_else(|e| die(&format!("{sdcp}: {e}")));
-        let report = cdc::analyze(&nl, &lib, &sdc).unwrap_or_else(|e| die(&e));
+        let mut report = cdc::analyze(&nl, &lib, &sdc).unwrap_or_else(|e| die(&e));
+        let outcome = waive::apply(&mut report, &waivers, as_of);
         emit_cdc_events(&report);
+        emit_waive_events(&outcome, &waivers);
         let n = report.crossings.iter().filter(|c| !c.synchronized).count();
         let t = if json {
-            with_report_path(&render_json(&report), opt(&args, "-o").as_deref())
+            with_report_path(&render_json(&report, &outcome), opt(&args, "-o").as_deref())
         } else {
-            render_text(&report)
+            format!(
+                "{}{}",
+                render_text(&report),
+                render_waived(&outcome, &waivers)
+            )
         };
         (t, n, report.multibit.len())
     };

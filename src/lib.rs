@@ -26,6 +26,7 @@ pub use vyges_loom::{liberty, names, netlist, sdc};
 
 pub mod cdc;
 pub mod rdc;
+pub mod waive;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const COPYRIGHT: &str = "© 2026 Vyges. All Rights Reserved.  https://vyges.com";

@@ -93,8 +93,9 @@ vyges-cdc check design.v --lib cells.lib --sdc design.sdc            # -> crossi
 vyges-cdc check design.v --lib cells.lib --sdc design.sdc --json
 vyges-cdc check design.v --lib cells.lib --sdc design.sdc --fail-on-violation  # exit 3
 vyges-cdc check design.v --lib cells.lib --sdc design.sdc --fail-on-multibit   # exit 3
+vyges-cdc check design.v --lib cells.lib --sdc design.sdc --waivers cdc-waivers.txt
 # flags: --lib FILE · --sdc FILE · -o FILE · --json · --fail-on-violation ·
-#        --fail-on-multibit · -h · -V
+#        --fail-on-multibit · --waivers FILE · --as-of YYYY-MM-DD · -h · -V
 ```
 
 Each **`create_clock`** in the SDC is a clock domain. The Liberty tells the engine
@@ -134,11 +135,50 @@ which cells are flops and which pins are clock / data / Q.
   CDC path* (combinational logic between domains, which a synchronizer must not
   have).
 
+## Waivers
+
+A checker that finds something real and gives no way to accept it gets switched off, and a
+switched-off checker finds nothing at all. Two findings here cannot be judged from structure:
+a **multi-bit crossing** is correct when the bus is gray-coded or handshake-qualified, and an
+unsynchronized crossing is sometimes deliberate. The netlist does not know; the design team
+does. `--waivers FILE` is where they say so, in plain text that diffs in review:
+
+```text
+# FIFO read pointer — reviewed with the async-FIFO design note
+waive:      multibit
+from:       core/wptr_gray_reg
+to:         core/wptr_sync_reg
+from_clock: clk_wr
+to_clock:   clk_rd
+reason:     gray-coded pointer; exactly one bit changes per transition
+approver:   a.engineer
+expires:    2027-01-01
+```
+
+Blocks separated by blank lines; `#` comments. `waive:` (`crossing` | `multibit` | `any`) and
+`reason:` are required — **a waiver with no reason cannot be reviewed, only inherited**, so the
+parser refuses it. The four name patterns default to `*` and accept `*` or `prefix*`. The same
+file waives `rdc` findings, which carry the same four names.
+
+What the report keeps saying, so accepting a finding never becomes hiding one:
+
+- **what was waived**, with its reason and the line it came from — a run whose output does not
+  show what was accepted can only be trusted, not reviewed;
+- **lapsed waivers**, which are *not applied*: their findings come back. That is what an expiry
+  is for, and it is the difference between a waiver and a permanent exemption;
+- **stale waivers** that matched nothing — the finding was fixed or the design moved, and a file
+  full of dead waivers stops being read;
+- **how many live waivers carry no expiry at all.**
+
+Expiry makes the answer depend on the date, which a sign-off run cannot have, so
+`--as-of YYYY-MM-DD` pins it and a result reproduces exactly as reported.
+
 ## Current state (v0.1.0)
 
 **Working & tested:** domain assignment (incl. tracing through clock buffers, and
 pin-form clock sources), the flop census and unplaced-flop disclosure,
-`set_clock_groups` relatedness, multi-bit bus grouping, cross-domain launch→capture detection through
+`set_clock_groups` relatedness, multi-bit bus grouping, waivers with reason/approver/
+expiry (and lapsed/stale disclosure), cross-domain launch→capture detection through
 arbitrary combinational cones, the canonical 2-flop synchronizer, and the
 "combinational logic on a CDC path" violation. Text + `--json` reports; a
 `--fail-on-violation` CI exit code.
@@ -151,8 +191,11 @@ arbitrary combinational cones, the canonical 2-flop synchronizer, and the
 - **Multi-bit crossings are reported but cannot be judged.** What makes one safe —
   gray coding, or a handshake that qualifies when the bus may be sampled — is a
   property of the data and the protocol, not of the netlist, so a correct multi-bit
-  crossing and a broken one look identical here. Hence the separate opt-in gate; a
-  waiver mechanism to mark a bus as intentional is not built yet.
+  crossing and a broken one look identical here. Hence the separate opt-in gate, and
+  the waiver file for the ones you have reviewed.
+- **Waiver policy is per-file, not per-organisation.** There is no shared waiver
+  repository, approval workflow or org-wide expiry policy — the mechanism is here,
+  the governance around it is not.
 - a bus whose bits are **not** named `base[i]` cannot be grouped — after synthesis
   that suffix is the only evidence left that the bits belong together;
 - only the **2-flop synchronizer** is recognized — handshake / FIFO / gray-code
