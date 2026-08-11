@@ -30,6 +30,9 @@ flags:
   -o FILE               write the report to FILE (default: stdout)
   --json                machine-readable JSON instead of text
   --fail-on-violation   exit 3 if any unsynchronized crossing is found (CI gate)
+  --fail-on-multibit    exit 3 on a multi-bit crossing too. Opt-in, because a gray-coded
+                        or handshake-qualified bus looks identical here and there is no
+                        waiver mechanism yet to silence one
   --describe            print a machine-readable JSON description of the command
   -h, --help · -V, --version
 ";
@@ -56,13 +59,14 @@ fn render_text(r: &CdcReport) -> String {
     // flops were never placed in a domain reads exactly like a clean result.
     s.push_str(&format!(
         "vyges-cdc — {} flop(s) ({} placed, {} unplaced), {} domain(s), \
-         {} crossing(s), {} unsynchronized\n",
+         {} crossing(s), {} unsynchronized, {} multi-bit\n",
         r.flops_total,
         r.flop_domain.len(),
         r.unplaced.len(),
         r.domains.len(),
         r.crossings.len(),
-        unsync
+        unsync,
+        r.multibit.len()
     ));
     if !r.unplaced.is_empty() {
         s.push_str(&format!(
@@ -78,6 +82,34 @@ fn render_text(r: &CdcReport) -> String {
             s.push_str(&format!(
                 "           … and {} more\n",
                 r.unplaced.len() - 10
+            ));
+        }
+    }
+    if !r.multibit.is_empty() {
+        // Placed before the crossing list on purpose: every bit of these is about to be
+        // printed as OK, and the reader needs to know that before reading the OKs.
+        s.push_str(&format!(
+            "  [warn] {} multi-bit crossing(s): each bit is synchronized, the BUS is not —\n\
+             \x20        independent synchronizers settle on different edges, so the receiver can\n\
+             \x20        latch a combination that never existed at the source. Safe only if the\n\
+             \x20        bus is gray-coded or handshake-qualified, which this check cannot see:\n",
+            r.multibit.len()
+        ));
+        for m in r.multibit.iter().take(20) {
+            s.push_str(&format!(
+                "           {}{} [{}] → {} [{}]   {} bits, each 2-flop synced\n",
+                m.bus_from,
+                m.bit_span(),
+                m.from_domain,
+                m.bus_to,
+                m.to_domain,
+                m.bits.len()
+            ));
+        }
+        if r.multibit.len() > 20 {
+            s.push_str(&format!(
+                "           … and {} more\n",
+                r.multibit.len() - 20
             ));
         }
     }
@@ -250,6 +282,21 @@ fn render_json(r: &CdcReport) -> String {
         "  \"unsynchronized\": {},\n",
         r.crossings.iter().filter(|c| !c.synchronized).count()
     ));
+    s.push_str(&format!("  \"multibit\": {},\n", r.multibit.len()));
+    s.push_str("  \"multibit_items\": [\n");
+    for (i, m) in r.multibit.iter().enumerate() {
+        let comma = if i + 1 < r.multibit.len() { "," } else { "" };
+        s.push_str(&format!(
+            "    {{\"bus_from\": \"{}\", \"bus_to\": \"{}\", \"from_domain\": \"{}\", \"to_domain\": \"{}\", \"bits\": [{}]}}{}\n",
+            m.bus_from,
+            m.bus_to,
+            m.from_domain,
+            m.to_domain,
+            m.bits.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(", "),
+            comma
+        ));
+    }
+    s.push_str("  ],\n");
     s.push_str("  \"items\": [\n");
     for (i, c) in r.crossings.iter().enumerate() {
         let comma = if i + 1 < r.crossings.len() { "," } else { "" };
@@ -298,6 +345,32 @@ fn emit_cdc_events(r: &CdcReport) {
             ]),
         );
     }
+    for m in &r.multibit {
+        emit(
+            &Event::new(
+                "vyges-cdc",
+                Severity::Warn,
+                format!(
+                    "multi-bit crossing: {}{} [{}] -> {} [{}] — {} bits each synchronized \
+                     independently, so the bus can be captured as a value that never existed \
+                     (safe only if gray-coded or handshake-qualified, which this check cannot see)",
+                    m.bus_from,
+                    m.bit_span(),
+                    m.from_domain,
+                    m.bus_to,
+                    m.to_domain,
+                    m.bits.len()
+                ),
+            )
+            .with_code("CDC-MULTIBIT")
+            .with_objects(vec![
+                format!("instance:{}", m.bus_from),
+                format!("instance:{}", m.bus_to),
+                format!("clock:{}", m.from_domain),
+                format!("clock:{}", m.to_domain),
+            ]),
+        );
+    }
     // Coverage before verdict: a clean run over a partly-placed design is a weaker statement
     // than a clean run over all of it, and only this event carries the difference to whatever
     // is reading the trail.
@@ -334,11 +407,12 @@ fn emit_cdc_events(r: &CdcReport) {
             },
             format!(
                 "cdc check complete: {} of {} flop(s) placed in {} domain(s); {} crossing(s), \
-                 {viols} unsynchronized",
+                 {viols} unsynchronized, {} multi-bit",
                 r.flop_domain.len(),
                 r.flops_total,
                 r.domains.len(),
-                r.crossings.len()
+                r.crossings.len(),
+                r.multibit.len()
             ),
         )
         .with_code("CDC-DONE"),
@@ -436,7 +510,7 @@ fn main() {
     let lib = Lib::load(&libp).unwrap_or_else(|e| die(&format!("{libp}: {e}")));
 
     let json = args.iter().any(|a| a == "--json");
-    let (text, unsync) = if reset_mode {
+    let (text, unsync, multibit) = if reset_mode {
         let report = rdc::analyze(&nl, &lib).unwrap_or_else(|e| die(&e));
         emit_rdc_events(&report);
         let n = report.crossings.iter().filter(|c| !c.synchronized).count();
@@ -445,7 +519,7 @@ fn main() {
         } else {
             render_rdc_text(&report)
         };
-        (t, n)
+        (t, n, 0usize)
     } else {
         let sdcp = opt(&args, "--sdc").expect("checked above");
         let sdc = Sdc::load(&sdcp).unwrap_or_else(|e| die(&format!("{sdcp}: {e}")));
@@ -457,7 +531,7 @@ fn main() {
         } else {
             render_text(&report)
         };
-        (t, n)
+        (t, n, report.multibit.len())
     };
     match opt(&args, "-o") {
         Some(p) => {
@@ -473,7 +547,14 @@ fn main() {
         }
         None => print!("{text}"),
     }
-    if args.iter().any(|a| a == "--fail-on-violation") && unsync > 0 {
+    let flagged = |f: &str| args.iter().any(|a| a == f);
+    // Two gates, not one. A multi-bit crossing is a real finding but not a proven defect —
+    // a gray-coded or handshake-qualified bus is structurally identical, and there is no
+    // waiver mechanism yet to silence one — so folding it into --fail-on-violation would
+    // break a correct design's build with no way out. Opt in instead.
+    if (flagged("--fail-on-violation") && unsync > 0)
+        || (flagged("--fail-on-multibit") && multibit > 0)
+    {
         exit(3);
     }
 }

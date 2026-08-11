@@ -12,9 +12,10 @@ still fail that way, so it is a separate report rather than a mode.
 > open standards and plain file formats — and meant to be accessible to everyone,
 > not only teams who can license a six-figure tool. `vyges-cdc` opens up CDC.
 
-> **Stability: experimental (v0.1.0).** Crossing detection and 2-flop synchronizer
-> recognition are real and tested; reconvergence, gray-code/handshake recognition,
-> and data-stability are not yet covered (see **Current state**). Use it as an
+> **Stability: experimental (v0.1.0).** Crossing detection, 2-flop synchronizer
+> recognition and multi-bit bus grouping are real and tested; reconvergence,
+> gray-code/handshake *recognition* (a multi-bit crossing is reported, never judged
+> safe), and data-stability are not yet covered (see **Current state**). Use it as an
 > early structural lint, not a sign-off CDC tool.
 
 ## Reset-domain crossings (`rdc`)
@@ -91,7 +92,9 @@ cargo build --release            # std-only beyond the shared parsers
 vyges-cdc check design.v --lib cells.lib --sdc design.sdc            # -> crossings report
 vyges-cdc check design.v --lib cells.lib --sdc design.sdc --json
 vyges-cdc check design.v --lib cells.lib --sdc design.sdc --fail-on-violation  # exit 3
-# flags: --lib FILE · --sdc FILE · -o FILE · --json · --fail-on-violation · -h · -V
+vyges-cdc check design.v --lib cells.lib --sdc design.sdc --fail-on-multibit   # exit 3
+# flags: --lib FILE · --sdc FILE · -o FILE · --json · --fail-on-violation ·
+#        --fail-on-multibit · -h · -V
 ```
 
 Each **`create_clock`** in the SDC is a clock domain. The Liberty tells the engine
@@ -116,6 +119,14 @@ which cells are flops and which pins are clock / data / Q.
   treated as asynchronous — the conservative reading.
 - **Crossing detection** — for each capture flop, its data cone is walked back to
   the launching flops; any launch flop in a *different* domain is a crossing.
+- **Multi-bit crossings** — bits of one bus (`data_reg[0]`, `data_reg[1]`, …) crossing
+  the same domain pair, each through **its own** synchronizer, are reported as a single
+  finding. Every bit is individually safe and every bit reads `OK`; the bus is not,
+  because the synchronizers settle on independent edges and the receiver can latch a
+  combination that never existed at the source — a counter crossing as `0111 → 1000`
+  can be read as `1111`. Reported, and gated only under `--fail-on-multibit`: a
+  gray-coded or handshake-qualified bus is structurally identical and perfectly correct,
+  and this check cannot tell them apart.
 - **Synchronizer recognition** — a crossing is reported **OK** when it is a clean
   two-flop synchronizer: the source Q drives the capture flop's D **directly** (no
   logic), and that flop's Q feeds a **second** flop in the same domain. Otherwise
@@ -127,21 +138,23 @@ which cells are flops and which pins are clock / data / Q.
 
 **Working & tested:** domain assignment (incl. tracing through clock buffers, and
 pin-form clock sources), the flop census and unplaced-flop disclosure,
-`set_clock_groups` relatedness, cross-domain launch→capture detection through
+`set_clock_groups` relatedness, multi-bit bus grouping, cross-domain launch→capture detection through
 arbitrary combinational cones, the canonical 2-flop synchronizer, and the
 "combinational logic on a CDC path" violation. Text + `--json` reports; a
 `--fail-on-violation` CI exit code.
 
 **Depth reserved (honest):**
 
-- **A multi-bit crossing is not recognized as one.** Each bit of a bus with its own
-  two-flop synchronizer is individually safe and reported `OK`, but the chains
-  resolve independently, so the receiver can latch a combination that never existed
-  at the source. Grouping bits of one bus into a single crossing is the next thing
-  to build here, and until it exists a per-bit-synchronized bus reads as clean.
 - **A flop clocked by a mux takes one of its clocks**, whichever the netlist wires
   first — so the other crossing is missed, and the answer depends on connection
   order. Tracing all reachable sources is the fix.
+- **Multi-bit crossings are reported but cannot be judged.** What makes one safe —
+  gray coding, or a handshake that qualifies when the bus may be sampled — is a
+  property of the data and the protocol, not of the netlist, so a correct multi-bit
+  crossing and a broken one look identical here. Hence the separate opt-in gate; a
+  waiver mechanism to mark a bus as intentional is not built yet.
+- a bus whose bits are **not** named `base[i]` cannot be grouped — after synthesis
+  that suffix is the only evidence left that the bits belong together;
 - only the **2-flop synchronizer** is recognized — handshake / FIFO / gray-code
   multi-bit crossings are reported as unsynchronized until those patterns are added;
 - **reconvergence** (multiple synchronized signals recombining) is not yet checked;

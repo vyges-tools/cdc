@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::liberty::{Dir, Lib};
+use crate::names::{split_bit_select, split_inst_pin};
 use crate::netlist::{Inst, Netlist};
 use crate::sdc::Sdc;
 
@@ -24,9 +25,54 @@ pub struct Crossing {
     pub synchronized: bool,
 }
 
+/// Bits of one bus crossing the same domain pair, **each through its own synchronizer**.
+///
+/// Every bit is individually safe and every bit reports `OK`. The bus is not safe: the
+/// synchronizers resolve independently, so two bits can settle on different capture edges and
+/// the receiver latches a combination that never existed at the source. A counter crossing as
+/// `0111 → 1000` can be read as `1111`.
+///
+/// The check cannot tell this apart from a **correctly** designed multi-bit crossing, because
+/// what makes one safe is not structural: gray coding (only one bit changes per transition) and
+/// handshake qualification (the receiver only samples while the bus is stable) are properties of
+/// the data and the protocol, not of the netlist. So this is reported as something to look at,
+/// not as a proven defect — and it is deliberately not part of the `--fail-on-violation` gate
+/// (see `--fail-on-multibit`).
+#[derive(Debug, Clone)]
+pub struct MultiBitCrossing {
+    pub from_domain: String,
+    pub to_domain: String,
+    /// Base name of the launching flops, bit-select stripped (`core/data_reg`).
+    pub bus_from: String,
+    /// Base name of the capturing (first-stage) flops.
+    pub bus_to: String,
+    /// The launch bit indices seen crossing, sorted.
+    pub bits: Vec<i64>,
+}
+
+impl MultiBitCrossing {
+    /// `data_reg[3:0]`-style span of the bits that cross.
+    pub fn bit_span(&self) -> String {
+        match (self.bits.first(), self.bits.last()) {
+            (Some(lo), Some(hi)) if self.bits.len() as i64 == hi - lo + 1 => format!("[{hi}:{lo}]"),
+            _ => format!(
+                "[{}]",
+                self.bits
+                    .iter()
+                    .map(|b| b.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct CdcReport {
     pub crossings: Vec<Crossing>,
+    /// Buses whose bits are each synchronized but which cross as a group. Every one of these
+    /// is reported `OK` bit by bit in [`crossings`](CdcReport::crossings) — that is the point.
+    pub multibit: Vec<MultiBitCrossing>,
     pub flop_domain: BTreeMap<String, String>, // flop instance -> domain
     pub domains: Vec<String>,
     /// Every sequential instance in the netlist, whether or not it could be placed.
@@ -160,7 +206,7 @@ fn launch_flops(
 /// flattened netlist puts hierarchy in the *instance* name, so `core/u_div/Q` is pin `Q` of
 /// instance `core/u_div`.
 fn source_net<'a>(source: &str, nl: &'a Netlist) -> Option<&'a str> {
-    let (inst_name, pin) = crate::names::split_inst_pin(source)?;
+    let (inst_name, pin) = split_inst_pin(source)?;
     let inst = nl.insts.iter().find(|i| i.name == inst_name)?;
     net_of(inst, pin)
 }
@@ -184,6 +230,54 @@ fn asynchronous(a: &str, b: &str, groups: &[Vec<String>]) -> bool {
         (Some(x), Some(y)) => x != y,
         _ => true,
     }
+}
+
+/// Group synchronized crossings into the buses they belong to.
+///
+/// Keyed on `(from_domain, to_domain, launch base, capture base)`: bits of one bus are launched
+/// by flops sharing a base name and captured by synchronizer flops sharing one, and a bus that
+/// crosses into two different places is two different crossings. Requiring **both** ends to
+/// match keeps two unrelated signals that happen to share a launch register file apart.
+///
+/// Only crossings already reported `OK` are grouped. A bit with no synchronizer is a violation
+/// on its own and is reported as one; the finding here is precisely the case that currently
+/// reads clean.
+///
+/// A design whose bus bits are not named `base[i]` — spelled `data0`, `data1` — cannot be
+/// grouped, because after synthesis the bit-select suffix is the only evidence left that the
+/// bits belong together.
+fn multi_bit_crossings(crossings: &[Crossing]) -> Vec<MultiBitCrossing> {
+    let mut groups: BTreeMap<(String, String, String, String), BTreeSet<i64>> = BTreeMap::new();
+    for c in crossings.iter().filter(|c| c.synchronized) {
+        let (bus_from, Some(bit)) = split_bit_select(&c.from_flop) else {
+            continue;
+        };
+        let (bus_to, Some(_)) = split_bit_select(&c.to_flop) else {
+            continue;
+        };
+        groups
+            .entry((
+                c.from_domain.clone(),
+                c.to_domain.clone(),
+                bus_from.to_string(),
+                bus_to.to_string(),
+            ))
+            .or_default()
+            .insert(bit);
+    }
+    groups
+        .into_iter()
+        .filter(|(_, bits)| bits.len() > 1)
+        .map(
+            |((from_domain, to_domain, bus_from, bus_to), bits)| MultiBitCrossing {
+                from_domain,
+                to_domain,
+                bus_from,
+                bus_to,
+                bits: bits.into_iter().collect(),
+            },
+        )
+        .collect()
 }
 
 pub fn analyze(nl: &Netlist, lib: &Lib, sdc: &Sdc) -> Result<CdcReport, String> {
@@ -295,8 +389,10 @@ pub fn analyze(nl: &Netlist, lib: &Lib, sdc: &Sdc) -> Result<CdcReport, String> 
     let mut domains: Vec<String> = sdc.clocks.iter().map(|c| c.name.clone()).collect();
     domains.sort();
     domains.dedup();
+    let multibit = multi_bit_crossings(&crossings);
     Ok(CdcReport {
         crossings,
+        multibit,
         flop_domain,
         domains,
         flops_total,
@@ -480,6 +576,79 @@ mod tests {
         let r = analyze(&nl, &lib(), &one).unwrap();
         assert!(r.crossings.is_empty(), "all three are declared related");
         assert_eq!(r.related_skipped, 2);
+    }
+
+    /// Two bits of one bus, each with its own clean 2-flop synchronizer.
+    const BUS_V: &str = "module t(clk1,clk2,d0,d1,y0,y1);\n\
+         input clk1,clk2,d0,d1; output y0,y1;\nwire a0,a1,s0,s1;\n\
+         DFF \\data_reg[0] (.CK(clk1),.D(d0),.Q(a0));\n\
+         DFF \\data_reg[1] (.CK(clk1),.D(d1),.Q(a1));\n\
+         DFF \\sync1_reg[0] (.CK(clk2),.D(a0),.Q(s0));\n\
+         DFF \\sync2_reg[0] (.CK(clk2),.D(s0),.Q(y0));\n\
+         DFF \\sync1_reg[1] (.CK(clk2),.D(a1),.Q(s1));\n\
+         DFF \\sync2_reg[1] (.CK(clk2),.D(s1),.Q(y1));\nendmodule\n";
+
+    #[test]
+    fn a_bus_synchronized_bit_by_bit_is_reported_as_a_multi_bit_crossing() {
+        // THE CASE THAT READ CLEAN. Every bit has a textbook two-flop synchronizer, so every
+        // bit is `OK` and the unsynchronized count is zero — and the bus is still broken,
+        // because the two chains resolve on independent edges and the receiver can latch a
+        // combination that never existed at the source.
+        let nl = crate::netlist::parse(BUS_V).unwrap();
+        let r = analyze(&nl, &lib(), &sdc()).unwrap();
+        assert_eq!(r.crossings.len(), 2);
+        assert!(
+            r.crossings.iter().all(|c| c.synchronized),
+            "each bit really is synchronized — that is what makes this silent"
+        );
+        assert_eq!(r.multibit.len(), 1, "and the bus is one finding");
+        let m = &r.multibit[0];
+        assert_eq!(m.bus_from, "data_reg");
+        assert_eq!(m.bus_to, "sync1_reg");
+        assert_eq!(m.bits, vec![0, 1]);
+        assert_eq!(m.bit_span(), "[1:0]");
+        assert_eq!(
+            (m.from_domain.as_str(), m.to_domain.as_str()),
+            ("clk1", "clk2")
+        );
+    }
+
+    #[test]
+    fn a_single_bit_crossing_is_not_a_bus() {
+        // One bit of a bus crossing alone is just a synchronized crossing. Reporting it as a
+        // multi-bit finding would put a warning on the most ordinary correct construct there
+        // is, which is how a check gets switched off.
+        let one = BUS_V
+            .replace("DFF \\data_reg[1] (.CK(clk1),.D(d1),.Q(a1));\n", "")
+            .replace("DFF \\sync1_reg[1] (.CK(clk2),.D(a1),.Q(s1));\n", "")
+            .replace("DFF \\sync2_reg[1] (.CK(clk2),.D(s1),.Q(y1));\n", "")
+            .replace(",y1)", ")")
+            .replace(" output y0,y1;", " output y0;")
+            .replace("wire a0,a1,s0,s1;", "wire a0,s0;")
+            .replace(",d1;", ";")
+            .replace(",d0,d1,", ",d0,");
+        let nl = crate::netlist::parse(&one).unwrap();
+        let r = analyze(&nl, &lib(), &sdc()).unwrap();
+        assert_eq!(r.crossings.len(), 1);
+        assert!(r.multibit.is_empty(), "one bit is not a bus");
+    }
+
+    #[test]
+    fn bits_that_are_not_all_synchronized_stay_ordinary_violations() {
+        // A bus whose bits lack synchronizers is already reported bit by bit, loudly. Adding a
+        // multi-bit finding on top would report the same defect twice under two names; the new
+        // finding exists only for the case that currently reads clean.
+        let unsafe_bus = BUS_V
+            .replace("DFF \\sync2_reg[0] (.CK(clk2),.D(s0),.Q(y0));\n", "")
+            .replace("DFF \\sync2_reg[1] (.CK(clk2),.D(s1),.Q(y1));\n", "")
+            .replace(".Q(s0));", ".Q(y0));")
+            .replace(".Q(s1));", ".Q(y1));")
+            .replace("wire a0,a1,s0,s1;", "wire a0,a1;");
+        let nl = crate::netlist::parse(&unsafe_bus).unwrap();
+        let r = analyze(&nl, &lib(), &sdc()).unwrap();
+        assert_eq!(r.crossings.len(), 2);
+        assert!(r.crossings.iter().all(|c| !c.synchronized));
+        assert!(r.multibit.is_empty(), "already reported as two violations");
     }
 
     #[test]
