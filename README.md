@@ -101,7 +101,19 @@ which cells are flops and which pins are clock / data / Q.
 
 - **Domain assignment** — every flop's clock pin is traced back (through clock
   buffers / inverters) to an SDC clock source; that source's name is the flop's
-  domain.
+  domain. A clock declared on a **pin** (`[get_pins u_div/Q]` — how a generated
+  clock is nearly always written) resolves to the net that pin drives, so it
+  places flops rather than declaring a domain nothing can join.
+- **Coverage, stated** — the report leads with a flop census: how many flops
+  exist, how many were **placed** in a domain, and **which were not**. A flop
+  whose clock does not trace to a declared clock is outside the analysis, so
+  crossings into or out of it cannot be seen; a clean run over a partly-placed
+  design says so instead of reading like a clean design.
+- **Related clocks are not crossings** — `set_clock_groups` is the SDC's own
+  statement about which clocks are asynchronous. Clocks in the same `-group` are
+  related and their pairs are counted, not flagged; clocks in different groups
+  are asynchronous. With no grouping declared, every differently-named clock is
+  treated as asynchronous — the conservative reading.
 - **Crossing detection** — for each capture flop, its data cone is walked back to
   the launching flops; any launch flop in a *different* domain is a crossing.
 - **Synchronizer recognition** — a crossing is reported **OK** when it is a clean
@@ -113,17 +125,29 @@ which cells are flops and which pins are clock / data / Q.
 
 ## Current state (v0.1.0)
 
-**Working & tested:** domain assignment (incl. tracing through clock buffers),
-cross-domain launch→capture detection through arbitrary combinational cones, the
-canonical 2-flop synchronizer, and the "combinational logic on a CDC path"
-violation. Text + `--json` reports; a `--fail-on-violation` CI exit code.
+**Working & tested:** domain assignment (incl. tracing through clock buffers, and
+pin-form clock sources), the flop census and unplaced-flop disclosure,
+`set_clock_groups` relatedness, cross-domain launch→capture detection through
+arbitrary combinational cones, the canonical 2-flop synchronizer, and the
+"combinational logic on a CDC path" violation. Text + `--json` reports; a
+`--fail-on-violation` CI exit code.
 
 **Depth reserved (honest):**
 
+- **A multi-bit crossing is not recognized as one.** Each bit of a bus with its own
+  two-flop synchronizer is individually safe and reported `OK`, but the chains
+  resolve independently, so the receiver can latch a combination that never existed
+  at the source. Grouping bits of one bus into a single crossing is the next thing
+  to build here, and until it exists a per-bit-synchronized bus reads as clean.
+- **A flop clocked by a mux takes one of its clocks**, whichever the netlist wires
+  first — so the other crossing is missed, and the answer depends on connection
+  order. Tracing all reachable sources is the fix.
 - only the **2-flop synchronizer** is recognized — handshake / FIFO / gray-code
   multi-bit crossings are reported as unsynchronized until those patterns are added;
 - **reconvergence** (multiple synchronized signals recombining) is not yet checked;
-- **divided / gated clocks** off a flop are not traced to a domain in v0;
+- **divided / gated clocks** off a flop are not traced to a domain in v0 — declare
+  them with `create_generated_clock` and they place normally; undeclared, their
+  flops are reported as unplaced rather than silently skipped;
 - glitch / data-stability and metastability-injection simulation are out of scope
   (structural only).
 

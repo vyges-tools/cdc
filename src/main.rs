@@ -40,17 +40,66 @@ fn opt(args: &[String], name: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
+/// A JSON array of quoted strings. Instance names come from a netlist, where an escaped
+/// identifier can legally carry a backslash — which would otherwise end the JSON string early.
+fn jlist(v: &[String]) -> String {
+    v.iter()
+        .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn render_text(r: &CdcReport) -> String {
     let mut s = String::new();
     let unsync = r.crossings.iter().filter(|c| !c.synchronized).count();
+    // Lead with the census, the way `rdc` does. Without it "0 crossings" over a design whose
+    // flops were never placed in a domain reads exactly like a clean result.
     s.push_str(&format!(
-        "vyges-cdc — {} domain(s), {} crossing(s), {} unsynchronized\n",
+        "vyges-cdc — {} flop(s) ({} placed, {} unplaced), {} domain(s), \
+         {} crossing(s), {} unsynchronized\n",
+        r.flops_total,
+        r.flop_domain.len(),
+        r.unplaced.len(),
         r.domains.len(),
         r.crossings.len(),
         unsync
     ));
+    if !r.unplaced.is_empty() {
+        s.push_str(&format!(
+            "  [warn] {} flop(s) are NOT in the analysis — their clock does not trace to a\n\
+             \x20        declared clock (a divided/gated clock off a flop, or an undeclared\n\
+             \x20        clock port). Crossings into or out of them cannot be seen:\n",
+            r.unplaced.len()
+        ));
+        for f in r.unplaced.iter().take(10) {
+            s.push_str(&format!("           {f}\n"));
+        }
+        if r.unplaced.len() > 10 {
+            s.push_str(&format!(
+                "           … and {} more\n",
+                r.unplaced.len() - 10
+            ));
+        }
+    }
+    if r.related_skipped > 0 {
+        s.push_str(&format!(
+            "  note: {} pair(s) cross clocks the SDC declares related (set_clock_groups) — \
+             timed, not crossed.\n",
+            r.related_skipped
+        ));
+    }
     if r.crossings.is_empty() {
-        s.push_str("  no clock-domain crossings.\n");
+        // Which kind of nothing this is. Three of them are distinguishable and they mean very
+        // different things to the person reading a passing run.
+        s.push_str(if r.flops_total == 0 {
+            "  nothing to check: this netlist has no sequential cells.\n"
+        } else if r.flop_domain.is_empty() {
+            "  nothing was checked: no flop could be placed in a declared clock domain.\n"
+        } else if r.unplaced.is_empty() {
+            "  no clock-domain crossings.\n"
+        } else {
+            "  no clock-domain crossings among the flops that were placed.\n"
+        });
         return s;
     }
     for c in r.crossings.iter().take(200) {
@@ -156,7 +205,7 @@ fn emit_rdc_events(r: &rdc::RdcReport) {
                     detail, c.from_flop, c.from_domain, c.to_flop, c.to_domain
                 ),
             )
-            .with_code(&format!("RDC-{kind}"))
+            .with_code(format!("RDC-{kind}"))
             .with_objects(vec![
                 format!("flop:{}", c.from_flop),
                 format!("flop:{}", c.to_flop),
@@ -187,6 +236,15 @@ fn emit_rdc_events(r: &rdc::RdcReport) {
 fn render_json(r: &CdcReport) -> String {
     let mut s = String::from("{\n");
     s.push_str(&format!("  \"domains\": {},\n", r.domains.len()));
+    s.push_str(&format!("  \"flops\": {},\n", r.flops_total));
+    s.push_str(&format!("  \"flops_placed\": {},\n", r.flop_domain.len()));
+    s.push_str(&format!(
+        "  \"related_pairs_skipped\": {},\n",
+        r.related_skipped
+    ));
+    // Named, not just counted: a consumer deciding whether to trust a clean run needs to know
+    // *which* flops were outside it.
+    s.push_str(&format!("  \"unplaced\": [{}],\n", jlist(&r.unplaced)));
     s.push_str(&format!("  \"crossings\": {},\n", r.crossings.len()));
     s.push_str(&format!(
         "  \"unsynchronized\": {},\n",
@@ -240,6 +298,32 @@ fn emit_cdc_events(r: &CdcReport) {
             ]),
         );
     }
+    // Coverage before verdict: a clean run over a partly-placed design is a weaker statement
+    // than a clean run over all of it, and only this event carries the difference to whatever
+    // is reading the trail.
+    if !r.unplaced.is_empty() {
+        emit(
+            &Event::new(
+                "vyges-cdc",
+                Severity::Warn,
+                format!(
+                    "{} of {} flop(s) are outside the analysis: their clock does not trace to a \
+                     declared clock (divided/gated clock off a flop, or an undeclared clock \
+                     port). Crossings involving them are not visible to this check",
+                    r.unplaced.len(),
+                    r.flops_total
+                ),
+            )
+            .with_code("CDC-UNPLACED")
+            .with_objects(
+                r.unplaced
+                    .iter()
+                    .take(50)
+                    .map(|f| format!("instance:{f}"))
+                    .collect(),
+            ),
+        );
+    }
     emit(
         &Event::new(
             "vyges-cdc",
@@ -249,7 +333,11 @@ fn emit_cdc_events(r: &CdcReport) {
                 Severity::Warn
             },
             format!(
-                "cdc check complete: {} crossing(s), {viols} unsynchronized",
+                "cdc check complete: {} of {} flop(s) placed in {} domain(s); {} crossing(s), \
+                 {viols} unsynchronized",
+                r.flop_domain.len(),
+                r.flops_total,
+                r.domains.len(),
                 r.crossings.len()
             ),
         )
