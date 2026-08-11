@@ -22,7 +22,7 @@
 //! Reads the same Liberty / Verilog / SDC the rest of Loom does. Pure std beyond
 //! the shared parsers.
 
-pub use vyges_loom::{liberty, netlist, sdc};
+pub use vyges_loom::{liberty, names, netlist, sdc};
 
 pub mod cdc;
 pub mod rdc;

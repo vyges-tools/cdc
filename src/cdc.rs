@@ -156,10 +156,11 @@ fn launch_flops(
 /// pin drives or it matches nothing: the clock is declared, the domain appears in the report,
 /// and not one flop is ever placed in it.
 ///
-/// A flattened netlist puts hierarchy in the *instance* name (`core/u_div/Q`), so the split is
-/// at the **last** separator, not the first.
+/// The last-separator rule this depends on lives in [`crate::names::split_inst_pin`] — a
+/// flattened netlist puts hierarchy in the *instance* name, so `core/u_div/Q` is pin `Q` of
+/// instance `core/u_div`.
 fn source_net<'a>(source: &str, nl: &'a Netlist) -> Option<&'a str> {
-    let (inst_name, pin) = source.rsplit_once('/')?;
+    let (inst_name, pin) = crate::names::split_inst_pin(source)?;
     let inst = nl.insts.iter().find(|i| i.name == inst_name)?;
     net_of(inst, pin)
 }
