@@ -13,11 +13,11 @@ use vyges_cdc::rdc;
 use vyges_cdc::{liberty::Lib, netlist, sdc::Sdc};
 
 const USAGE: &str = "\
-vyges-cdc — structural clock- and reset-domain-crossing checks
+vyges loom cdc — structural clock- and reset-domain-crossing checks
 
 usage:
-  vyges-cdc check NETLIST --lib L.lib --sdc S.sdc [-o OUT] [--json] [--fail-on-violation]
-  vyges-cdc rdc   NETLIST --lib L.lib           [-o OUT] [--json] [--fail-on-violation]
+  vyges loom cdc check NETLIST --lib L.lib --sdc S.sdc [-o OUT] [--json] [--fail-on-violation]
+  vyges loom cdc rdc   NETLIST --lib L.lib           [-o OUT] [--json] [--fail-on-violation]
 
 `check` finds CLOCK-domain crossings; `rdc` finds RESET-domain crossings — a flop
 asynchronously reset by one reset feeding a flop reset by another. A single-clock design is
