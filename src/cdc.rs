@@ -73,7 +73,9 @@ pub struct CdcReport {
     /// Buses whose bits are each synchronized but which cross as a group. Every one of these
     /// is reported `OK` bit by bit in [`crossings`](CdcReport::crossings) — that is the point.
     pub multibit: Vec<MultiBitCrossing>,
-    pub flop_domain: BTreeMap<String, String>, // flop instance -> domain
+    /// Flop instance -> the declared clock domain(s) reaching its clock pin, sorted. More than
+    /// one means a clock mux.
+    pub flop_domain: BTreeMap<String, Vec<String>>,
     pub domains: Vec<String>,
     /// Every sequential instance in the netlist, whether or not it could be placed.
     pub flops_total: usize,
@@ -84,6 +86,11 @@ pub struct CdcReport {
     /// a partly-placed design means something weaker than it appears to. Naming them is the
     /// difference between "I looked and it was clean" and "I could not look at all of it".
     pub unplaced: Vec<String>,
+    /// Flops reachable from more than one declared clock — a clock mux. Each is analysed in
+    /// **every** domain that reaches it, so both sides of the mux are checked; the list is here
+    /// because a muxed clock is a design construct worth knowing about (whether the mux is
+    /// glitch-free is a question this check does not ask).
+    pub multi_clocked: Vec<String>,
     /// Launch→capture pairs in *different* domains that the SDC declares **related** to each
     /// other, so they are timed rather than crossed. Counted, not reported as crossings —
     /// a number here says the clock grouping was read and applied.
@@ -133,36 +140,44 @@ fn flop_pins(lib: &Lib, cell: &str) -> Option<(String, Vec<String>, Vec<String>)
     Some((clk, d, q))
 }
 
-/// Trace a clock net back (through combinational clock cells) to an SDC clock
-/// source; return its domain name.
-fn trace_clock(
+/// Trace a clock net back through combinational clock cells to **every** SDC clock source that
+/// reaches it.
+///
+/// Every one, not the first. A clock mux has two clocks arriving at one flop and both are real:
+/// returning whichever the netlist happened to wire first missed the other crossing entirely,
+/// and made the verdict depend on connection order — the same design reported 0 or 1 crossings
+/// depending on how the synthesiser wrote the mux instance. A set, walked in sorted order, is
+/// also the only version of this that is deterministic.
+///
+/// Recursion stops at a declared clock source (it is the boundary), at a cycle, and at a
+/// sequential cell (a divided clock off a flop, the v0 limit stated in the README).
+fn trace_clocks(
     net: &str,
     nd: &BTreeMap<String, Driver>,
     nl: &Netlist,
     lib: &Lib,
     src: &BTreeMap<String, String>,
     seen: &mut BTreeSet<String>,
-) -> Option<String> {
+    out: &mut BTreeSet<String>,
+) {
     if let Some(d) = src.get(net) {
-        return Some(d.clone());
+        out.insert(d.clone());
+        return;
     }
     if !seen.insert(net.to_string()) {
-        return None;
+        return;
     }
-    let drv = nd.get(net)?;
-    let i = drv.inst?; // a port that isn't an SDC clock source -> unknown
+    let Some(drv) = nd.get(net) else { return };
+    let Some(i) = drv.inst else { return }; // a port that isn't an SDC clock source -> unknown
     if drv.is_seq {
-        return None; // divided/gated clock off a flop — not modelled in v0
+        return; // divided/gated clock off a flop — not modelled in v0
     }
     let inst = &nl.insts[i];
     for (pin, n) in &inst.conns {
         if is_in(lib, &inst.cell, pin) {
-            if let Some(d) = trace_clock(n, nd, nl, lib, src, seen) {
-                return Some(d);
-            }
+            trace_clocks(n, nd, nl, lib, src, seen, out);
         }
     }
-    None
 }
 
 /// Walk a data net's combinational cone back to launching flops. Each result is
@@ -325,26 +340,31 @@ pub fn analyze(nl: &Netlist, lib: &Lib, sdc: &Sdc) -> Result<CdcReport, String> 
         }
     }
 
-    // domain per flop instance (trace clock pin)
-    let mut flop_domain: BTreeMap<String, String> = BTreeMap::new();
+    // domain(s) per flop instance (trace clock pin)
+    let mut flop_domain: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut flops_total = 0usize;
     let mut unplaced: Vec<String> = Vec::new();
+    let mut multi_clocked: Vec<String> = Vec::new();
     for inst in &nl.insts {
         let Some((clk, _, _)) = flop_pins(lib, &inst.cell) else {
             continue;
         };
         flops_total += 1;
-        let dom = net_of(inst, &clk)
-            .and_then(|cn| trace_clock(cn, &nd, nl, lib, &src, &mut BTreeSet::new()));
-        match dom {
-            Some(d) => {
-                flop_domain.insert(inst.name.clone(), d);
-            }
+        let mut doms = BTreeSet::new();
+        if let Some(cn) = net_of(inst, &clk) {
+            trace_clocks(cn, &nd, nl, lib, &src, &mut BTreeSet::new(), &mut doms);
+        }
+        if doms.is_empty() {
             // Unplaced: a divided or gated clock off a flop, or a clock port the SDC never
             // declared. Recorded rather than passed over, because everything downstream skips
             // this flop and the report would otherwise look complete.
-            None => unplaced.push(inst.name.clone()),
+            unplaced.push(inst.name.clone());
+            continue;
         }
+        if doms.len() > 1 {
+            multi_clocked.push(inst.name.clone());
+        }
+        flop_domain.insert(inst.name.clone(), doms.into_iter().collect());
     }
 
     // crossings: for each capture flop, walk its D cone to launch flops
@@ -354,7 +374,7 @@ pub fn analyze(nl: &Netlist, lib: &Lib, sdc: &Sdc) -> Result<CdcReport, String> 
         let Some((_, dpins, _)) = flop_pins(lib, &inst.cell) else {
             continue;
         };
-        let Some(dc) = flop_domain.get(&inst.name) else {
+        let Some(capture_domains) = flop_domain.get(&inst.name) else {
             continue;
         };
         for d in &dpins {
@@ -363,25 +383,33 @@ pub fn analyze(nl: &Netlist, lib: &Lib, sdc: &Sdc) -> Result<CdcReport, String> 
             launch_flops(dn, true, &nd, nl, lib, &mut BTreeSet::new(), &mut launches);
             for (li, direct) in launches {
                 let lname = &nl.insts[li].name;
-                let Some(dl) = flop_domain.get(lname) else {
+                let Some(launch_domains) = flop_domain.get(lname) else {
                     continue;
                 };
-                if dl == dc {
-                    continue; // same domain, not a crossing
+                // Every launch/capture domain pair. A muxed flop is genuinely in more than one
+                // domain, and each pair that is asynchronous is a separate real crossing — the
+                // signal does cross both ways, at different times.
+                for dl in launch_domains {
+                    for dc in capture_domains {
+                        if dl == dc {
+                            continue; // same domain, not a crossing
+                        }
+                        if !asynchronous(dl, dc, &sdc.async_groups) {
+                            related_skipped += 1; // declared related: timed, not crossed
+                            continue;
+                        }
+                        let synchronized =
+                            direct && has_second_stage(inst, dc, lib, nl, &nd, &flop_domain);
+                        crossings.push(Crossing {
+                            from_flop: lname.clone(),
+                            from_domain: dl.clone(),
+                            to_flop: inst.name.clone(),
+                            to_domain: dc.clone(),
+                            through_logic: !direct,
+                            synchronized,
+                        });
+                    }
                 }
-                if !asynchronous(dl, dc, &sdc.async_groups) {
-                    related_skipped += 1; // declared related: timed, not crossed
-                    continue;
-                }
-                let synchronized = direct && has_second_stage(inst, dc, lib, nl, &nd, &flop_domain);
-                crossings.push(Crossing {
-                    from_flop: lname.clone(),
-                    from_domain: dl.clone(),
-                    to_flop: inst.name.clone(),
-                    to_domain: dc.clone(),
-                    through_logic: !direct,
-                    synchronized,
-                });
             }
         }
     }
@@ -397,6 +425,7 @@ pub fn analyze(nl: &Netlist, lib: &Lib, sdc: &Sdc) -> Result<CdcReport, String> 
         domains,
         flops_total,
         unplaced,
+        multi_clocked,
         related_skipped,
     })
 }
@@ -409,7 +438,7 @@ fn has_second_stage(
     lib: &Lib,
     nl: &Netlist,
     nd: &BTreeMap<String, Driver>,
-    flop_domain: &BTreeMap<String, String>,
+    flop_domain: &BTreeMap<String, Vec<String>>,
 ) -> bool {
     let Some((_, _, qpins)) = flop_pins(lib, &cap.cell) else {
         return false;
@@ -417,7 +446,13 @@ fn has_second_stage(
     for q in &qpins {
         let Some(qn) = net_of(cap, q) else { continue };
         for s2 in &nl.insts {
-            if flop_domain.get(&s2.name).map(String::as_str) != Some(domain) {
+            // The second stage must be clocked by the domain this crossing lands in. With a
+            // muxed flop that is membership, not equality — it may sit in several.
+            if !flop_domain
+                .get(&s2.name)
+                .map(|ds| ds.iter().any(|d| d == domain))
+                .unwrap_or(false)
+            {
                 continue;
             }
             let Some((_, d2pins, _)) = flop_pins(lib, &s2.cell) else {
@@ -458,8 +493,8 @@ mod tests {
         )
         .unwrap();
         let r = analyze(&nl, &lib(), &sdc()).unwrap();
-        assert_eq!(r.flop_domain.get("a"), Some(&"clk1".to_string()));
-        assert_eq!(r.flop_domain.get("b"), Some(&"clk2".to_string()));
+        assert_eq!(r.flop_domain.get("a"), Some(&vec!["clk1".to_string()]));
+        assert_eq!(r.flop_domain.get("b"), Some(&vec!["clk2".to_string()]));
         let c: Vec<_> = r.crossings.iter().filter(|c| c.to_flop == "b").collect();
         assert_eq!(c.len(), 1);
         assert_eq!(
@@ -510,7 +545,7 @@ mod tests {
         )
         .unwrap();
         let r = analyze(&nl, &lib(), &sdc).unwrap();
-        assert_eq!(r.flop_domain.get("cap"), Some(&"clk_div".to_string()));
+        assert_eq!(r.flop_domain.get("cap"), Some(&vec!["clk_div".to_string()]));
         assert!(
             r.unplaced.is_empty(),
             "every flop is placed: {:?}",
@@ -649,6 +684,78 @@ mod tests {
         assert_eq!(r.crossings.len(), 2);
         assert!(r.crossings.iter().all(|c| !c.synchronized));
         assert!(r.multibit.is_empty(), "already reported as two violations");
+    }
+
+    /// A clock mux: `cap` runs on clk1 **or** clk2 depending on `sel`, and is fed by a flop on
+    /// each. `{A}` / `{B}` are substituted to write the same design with the mux inputs wired
+    /// in either order.
+    const MUX_V: &str = "module t(clk1,clk2,sel,d,y);\ninput clk1,clk2,sel,d; output y;\n\
+         wire mclk,q1,q2;\n\
+         MUX2 u_mux(.A({A}),.B({B}),.S(sel),.Y(mclk));\n\
+         DFF s1(.CK(clk1),.D(d),.Q(q1));\n\
+         DFF s2(.CK(clk2),.D(q1),.Q(q2));\n\
+         DFF cap(.CK(mclk),.D(q1),.Q(y));\nendmodule\n";
+
+    fn mux_lib() -> Lib {
+        // The demo library has no mux; the shape is all this needs.
+        let mut text = std::fs::read_to_string("examples/cells.lib").expect("cells.lib");
+        let end = text.rfind('}').expect("library close");
+        text.insert_str(
+            end,
+            "  cell (MUX2) {\n    pin (A) { direction : input; }\n\
+             \x20   pin (B) { direction : input; }\n    pin (S) { direction : input; }\n\
+             \x20   pin (Y) { direction : output; }\n  }\n",
+        );
+        Lib::parse(&text).expect("lib with a mux")
+    }
+
+    #[test]
+    fn a_muxed_clock_puts_a_flop_in_every_domain_that_reaches_it() {
+        // THE PIN-ORDER BUG. Tracing returned the first clock it found, so this design reported
+        // 0 crossings or 1 depending on which mux input the netlist happened to name first —
+        // and both answers were incomplete, because the flop really is clocked by both.
+        let lib = mux_lib();
+        for (a, b) in [("clk1", "clk2"), ("clk2", "clk1")] {
+            let nl = crate::netlist::parse(&MUX_V.replace("{A}", a).replace("{B}", b)).unwrap();
+            let r = analyze(&nl, &lib, &sdc()).unwrap();
+            assert_eq!(
+                r.flop_domain.get("cap"),
+                Some(&vec!["clk1".to_string(), "clk2".to_string()]),
+                "cap is clocked by both, wired {a}/{b}"
+            );
+            assert_eq!(r.multi_clocked, vec!["cap".to_string()]);
+            // s1 (clk1) -> cap: a crossing in cap's clk2 domain and not in its clk1 one.
+            let into_cap: Vec<_> = r.crossings.iter().filter(|c| c.to_flop == "cap").collect();
+            assert_eq!(into_cap.len(), 1, "wired {a}/{b}");
+            assert_eq!(
+                (
+                    into_cap[0].from_domain.as_str(),
+                    into_cap[0].to_domain.as_str()
+                ),
+                ("clk1", "clk2")
+            );
+        }
+    }
+
+    #[test]
+    fn the_verdict_does_not_depend_on_the_order_the_mux_was_wired() {
+        // A sign-off answer that changes when a synthesiser reorders a connection is not an
+        // answer. Same design, both spellings, byte-identical findings.
+        let lib = mux_lib();
+        let render = |a: &str, b: &str| {
+            let nl = crate::netlist::parse(&MUX_V.replace("{A}", a).replace("{B}", b)).unwrap();
+            let r = analyze(&nl, &lib, &sdc()).unwrap();
+            r.crossings
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{} [{}] -> {} [{}] sync={}",
+                        c.from_flop, c.from_domain, c.to_flop, c.to_domain, c.synchronized
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(render("clk1", "clk2"), render("clk2", "clk1"));
     }
 
     #[test]

@@ -120,6 +120,11 @@ which cells are flops and which pins are clock / data / Q.
   treated as asynchronous — the conservative reading.
 - **Crossing detection** — for each capture flop, its data cone is walked back to
   the launching flops; any launch flop in a *different* domain is a crossing.
+- **Clock muxes** — a flop whose clock pin is reachable from more than one declared
+  clock is analysed in **every** one of them, and listed in the report. Taking the
+  first clock found would miss the other crossing and make the verdict depend on the
+  order the mux happened to be wired; whether the mux itself is glitch-free is a
+  question this check does not ask.
 - **Multi-bit crossings** — bits of one bus (`data_reg[0]`, `data_reg[1]`, …) crossing
   the same domain pair, each through **its own** synchronizer, are reported as a single
   finding. Every bit is individually safe and every bit reads `OK`; the bus is not,
@@ -177,17 +182,14 @@ Expiry makes the answer depend on the date, which a sign-off run cannot have, so
 
 **Working & tested:** domain assignment (incl. tracing through clock buffers, and
 pin-form clock sources), the flop census and unplaced-flop disclosure,
-`set_clock_groups` relatedness, multi-bit bus grouping, waivers with reason/approver/
-expiry (and lapsed/stale disclosure), cross-domain launch→capture detection through
+`set_clock_groups` relatedness, multi-clocked (muxed) flops, multi-bit bus grouping,
+waivers with reason/approver/expiry (and lapsed/stale disclosure), cross-domain launch→capture detection through
 arbitrary combinational cones, the canonical 2-flop synchronizer, and the
 "combinational logic on a CDC path" violation. Text + `--json` reports; a
 `--fail-on-violation` CI exit code.
 
 **Depth reserved (honest):**
 
-- **A flop clocked by a mux takes one of its clocks**, whichever the netlist wires
-  first — so the other crossing is missed, and the answer depends on connection
-  order. Tracing all reachable sources is the fix.
 - **Multi-bit crossings are reported but cannot be judged.** What makes one safe —
   gray coding, or a handshake that qualifies when the bus may be sampled — is a
   property of the data and the protocol, not of the netlist, so a correct multi-bit

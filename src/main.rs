@@ -221,6 +221,31 @@ fn render_text(r: &CdcReport) -> String {
             ));
         }
     }
+    if !r.multi_clocked.is_empty() {
+        // Not a violation: a clock mux is a normal construct, and each side of it is analysed.
+        // Worth naming because "this flop is in two domains" explains crossing counts that
+        // otherwise look doubled, and because whether the mux is glitch-free is a question
+        // this check does not ask.
+        s.push_str(&format!(
+            "  note: {} flop(s) are clocked by more than one domain (a clock mux); each is \
+             checked in every domain that reaches it:\n",
+            r.multi_clocked.len()
+        ));
+        for f in r.multi_clocked.iter().take(10) {
+            let doms = r
+                .flop_domain
+                .get(f)
+                .map(|d| d.join(", "))
+                .unwrap_or_default();
+            s.push_str(&format!("           {f}  [{doms}]\n"));
+        }
+        if r.multi_clocked.len() > 10 {
+            s.push_str(&format!(
+                "           … and {} more\n",
+                r.multi_clocked.len() - 10
+            ));
+        }
+    }
     if r.related_skipped > 0 {
         s.push_str(&format!(
             "  note: {} pair(s) cross clocks the SDC declares related (set_clock_groups) — \
@@ -391,6 +416,10 @@ fn render_json(r: &CdcReport, o: &waive::WaiveOutcome) -> String {
         r.crossings.iter().filter(|c| !c.synchronized).count()
     ));
     s.push_str(&format!("  \"multibit\": {},\n", r.multibit.len()));
+    s.push_str(&format!(
+        "  \"multi_clocked\": [{}],\n",
+        jlist(&r.multi_clocked)
+    ));
     s.push_str(&format!("  \"waived\": {},\n", o.waived.len()));
     s.push_str(&format!("  \"waivers_lapsed\": {},\n", o.lapsed.len()));
     s.push_str(&format!("  \"waivers_stale\": {},\n", o.stale.len()));
