@@ -578,7 +578,7 @@ fn with_report_path(json: &str, path: Option<&str>) -> String {
     format!("{{\"report_path\": \"{esc}\"{sep}{rest}")
 }
 
-fn main() {
+pub fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--describe") {
         // Machine-readable description of `check` for tooling that drives it.

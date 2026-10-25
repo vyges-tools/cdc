@@ -9,6 +9,11 @@ homepage = "https://vyges.com"
 repository = "https://github.com/vyges-tools/cdc"
 
 # Parsers (netlist / Liberty / SDC) come from the vyges-loom foundation.
+[features]
+# The command-line entry built into the library too (`cli_main`), for the suite binaries
+# that link every engine and run the one they are invoked as.
+suite = []
+
 [dependencies]
 vyges-loom = { git = "https://github.com/vyges-tools/loom", branch = "main" }
 # Structured events (vyges-events/1.0) for the MCP causal trail. Core-only (no tracing
