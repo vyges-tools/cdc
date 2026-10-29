@@ -12,7 +12,7 @@ still fail that way, so it is a separate report rather than a mode.
 > open standards and plain file formats — and meant to be accessible to everyone,
 > not only teams who can license a six-figure tool. `vyges-cdc` opens up CDC.
 
-> **Stability: experimental (v0.1.0).** Crossing detection, 2-flop synchronizer
+> **Stability: stable, actively developed.** Crossing detection, 2-flop synchronizer
 > recognition and multi-bit bus grouping are real and tested; reconvergence,
 > gray-code/handshake *recognition* (a multi-bit crossing is reported, never judged
 > safe), and data-stability are not yet covered (see **Current state**). Use it as an
@@ -178,7 +178,7 @@ What the report keeps saying, so accepting a finding never becomes hiding one:
 Expiry makes the answer depend on the date, which a sign-off run cannot have, so
 `--as-of YYYY-MM-DD` pins it and a result reproduces exactly as reported.
 
-## Current state (v0.1.0)
+## Current state
 
 **Working & tested:** domain assignment (incl. tracing through clock buffers, and
 pin-form clock sources), the flop census and unplaced-flop disclosure,
