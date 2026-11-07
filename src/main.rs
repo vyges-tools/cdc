@@ -253,6 +253,13 @@ fn render_text(r: &CdcReport) -> String {
             r.related_skipped
         ));
     }
+    if r.synchronous_skipped > 0 {
+        s.push_str(&format!(
+            "  note: {} pair(s) cross between a clock and one generated from it (or two from one \
+             clock) — synchronous, timed, not crossed.\n",
+            r.synchronous_skipped
+        ));
+    }
     if r.crossings.is_empty() {
         // Which kind of nothing this is. Three of them are distinguishable and they mean very
         // different things to the person reading a passing run.
@@ -407,6 +414,7 @@ fn render_json(r: &CdcReport, o: &waive::WaiveOutcome) -> String {
         "  \"related_pairs_skipped\": {},\n",
         r.related_skipped
     ));
+    s.push_str(&format!("  \"synchronous_pairs_skipped\": {},\n", r.synchronous_skipped));
     // Named, not just counted: a consumer deciding whether to trust a clean run needs to know
     // *which* flops were outside it.
     s.push_str(&format!("  \"unplaced\": [{}],\n", jlist(&r.unplaced)));

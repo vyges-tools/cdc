@@ -11,6 +11,7 @@ use crate::liberty::{Dir, Lib};
 use crate::names::{split_bit_select, split_inst_pin};
 use crate::netlist::{Inst, Netlist};
 use crate::sdc::{ClockGroups, Sdc};
+use vyges_loom::sdc_clock_relations::Families;
 
 #[derive(Debug, Clone)]
 pub struct Crossing {
@@ -95,6 +96,10 @@ pub struct CdcReport {
     /// other, so they are timed rather than crossed. Counted, not reported as crossings —
     /// a number here says the clock grouping was read and applied.
     pub related_skipped: usize,
+    /// Launch→capture pairs in two clocks of ONE family (a generated clock and its master, or two
+    /// generated from one clock), which no `set_clock_groups` separates: synchronous by
+    /// construction, timed by the timer, not crossed. Counted, like `related_skipped`.
+    pub synchronous_skipped: usize,
 }
 
 /// What drives a net.
@@ -226,14 +231,27 @@ fn source_net<'a>(source: &str, nl: &'a Netlist) -> Option<&'a str> {
     net_of(inst, pin)
 }
 
-/// Are two domains asynchronous to each other?
+/// How two clock domains relate, for CDC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Relation {
+    /// A crossing: the SDC separates them, or says nothing that relates them.
+    Asynchronous,
+    /// A command puts them in one group, and none separates them.
+    Related,
+    /// One family (one is generated from the other, or both from one clock), and no command
+    /// separates them.
+    Synchronous,
+}
+
+/// How two domains relate.
 ///
 /// `set_clock_groups` is the SDC's own statement about this, read per COMMAND, as the timer
 /// reads it ([`vyges_loom::sdc::clocks_unrelated`]): two clocks are asynchronous when any one
 /// command puts them in different groups, or is a single group holding one of them. They are
-/// related when a command puts them in one group and no command separates them. Without either,
-/// every differently-named clock is a crossing; that is noisy on a real SoC, but it is the
-/// conservative reading.
+/// related when a command puts them in one group and no command separates them. Two clocks of
+/// one family ([`vyges_loom::sdc_clock_relations::families`], each generated clock's master
+/// found as the timer finds it) are synchronous unless a command separates them. Otherwise every
+/// differently-named clock is a crossing: noisy on a real SoC, but the conservative reading.
 ///
 /// For CDC, `-asynchronous -allow_paths` separates too: the timer still times those paths, but
 /// the clocks are declared asynchronous and each crossing needs a synchronizer.
@@ -241,16 +259,25 @@ fn source_net<'a>(source: &str, nl: &'a Netlist) -> Option<&'a str> {
 /// ⛔ The groups of all commands were once merged into one list and a clock looked up in the
 /// first group naming it. A file that groups `{a b}` in one command and separates `a` from `b`
 /// in another then read `a` and `b` as related, and the crossing was never reported.
-fn asynchronous(a: &str, b: &str, groups: &[ClockGroups]) -> bool {
+fn relation(a: &str, b: &str, groups: &[ClockGroups], families: &Families) -> Relation {
     if a == b {
-        return false;
+        return Relation::Synchronous;
     }
     let declared: Vec<ClockGroups> = groups.iter().map(|g| ClockGroups { allow_paths: false, ..g.clone() }).collect();
     if vyges_loom::sdc::clocks_unrelated(&declared, a, b) {
-        return true;
+        return Relation::Asynchronous;
+    }
+    // An undecided clock is its own family root, and no other clock's chain ends at it, so two
+    // different clocks share a root only when both chains reached the same create_clock.
+    if families.root.contains_key(a) && families.root.get(a) == families.root.get(b) {
+        return Relation::Synchronous;
     }
     let together = groups.iter().any(|g| g.groups.iter().any(|grp| grp.iter().any(|n| n == a) && grp.iter().any(|n| n == b)));
-    !together
+    if together {
+        Relation::Related
+    } else {
+        Relation::Asynchronous
+    }
 }
 
 /// Group synchronized crossings into the buses they belong to.
@@ -376,6 +403,8 @@ pub fn analyze(nl: &Netlist, lib: &Lib, sdc: &Sdc) -> Result<CdcReport, String> 
     // crossings: for each capture flop, walk its D cone to launch flops
     let mut crossings = Vec::new();
     let mut related_skipped = 0usize;
+    let mut synchronous_skipped = 0usize;
+    let families = vyges_loom::sdc_clock_relations::families(sdc, Some((nl, lib)));
     for inst in &nl.insts {
         let Some((_, dpins, _)) = flop_pins(lib, &inst.cell) else {
             continue;
@@ -400,9 +429,16 @@ pub fn analyze(nl: &Netlist, lib: &Lib, sdc: &Sdc) -> Result<CdcReport, String> 
                         if dl == dc {
                             continue; // same domain, not a crossing
                         }
-                        if !asynchronous(dl, dc, &sdc.clock_groups) {
-                            related_skipped += 1; // declared related: timed, not crossed
-                            continue;
+                        match relation(dl, dc, &sdc.clock_groups, &families) {
+                            Relation::Related => {
+                                related_skipped += 1; // declared related: timed, not crossed
+                                continue;
+                            }
+                            Relation::Synchronous => {
+                                synchronous_skipped += 1; // one family: timed, not crossed
+                                continue;
+                            }
+                            Relation::Asynchronous => {}
                         }
                         let synchronized =
                             direct && has_second_stage(inst, dc, lib, nl, &nd, &flop_domain);
@@ -433,6 +469,7 @@ pub fn analyze(nl: &Netlist, lib: &Lib, sdc: &Sdc) -> Result<CdcReport, String> 
         unplaced,
         multi_clocked,
         related_skipped,
+        synchronous_skipped,
     })
 }
 
@@ -644,6 +681,32 @@ mod tests {
             1,
             "-allow_paths declares them asynchronous though another command groups them"
         );
+    }
+
+    /// A divide-by-2 off clk1 is clk1's family: a clk1 -> clk_div path is timed, not crossed,
+    /// unless the SDC separates the two; clk2 -> clk_div still crosses.
+    #[test]
+    fn a_generated_clock_and_its_master_are_synchronous() {
+        let nl = crate::netlist::parse(
+            "module t(clk1,clk2,d,y,z);\ninput clk1,clk2,d; output y,z;\n\
+             wire clk_div,div_n,q1,q2;\n\
+             DFF u_div(.CK(clk1),.D(div_n),.Q(clk_div));\nINV u_dinv(.A(clk_div),.Y(div_n));\n\
+             DFF a(.CK(clk1),.D(d),.Q(q1));\nDFF b(.CK(clk2),.D(d),.Q(q2));\n\
+             DFF ca(.CK(clk_div),.D(q1),.Q(y));\nDFF cb(.CK(clk_div),.D(q2),.Q(z));\nendmodule\n",
+        )
+        .unwrap();
+        let base = "create_clock -name clk1 -period 10 [get_ports clk1]\n\
+                    create_clock -name clk2 -period 7 [get_ports clk2]\n\
+                    create_generated_clock -name clk_div -source [get_ports clk1] -divide_by 2 [get_pins u_div/Q]\n";
+        let run = |extra: &str| analyze(&nl, &lib(), &Sdc::parse(&format!("{base}{extra}")).unwrap()).unwrap();
+        let r = run("");
+        let to: Vec<&str> = r.crossings.iter().map(|c| c.to_flop.as_str()).collect();
+        assert_eq!(to, ["cb"], "only clk2 -> clk_div crosses");
+        assert_eq!(r.synchronous_skipped, 1, "clk1 -> clk_div is one family");
+        // separated by the SDC: the family pair is a crossing again
+        let r = run("set_clock_groups -asynchronous -group clk1 -group {clk_div clk2}\n");
+        assert!(r.crossings.iter().any(|c| c.to_flop == "ca"), "{:?}", r.crossings);
+        assert_eq!(r.synchronous_skipped, 0);
     }
 
     /// Two bits of one bus, each with its own clean 2-flop synchronizer.

@@ -114,10 +114,17 @@ which cells are flops and which pins are clock / data / Q.
   crossings into or out of it cannot be seen; a clean run over a partly-placed
   design says so instead of reading like a clean design.
 - **Related clocks are not crossings** — `set_clock_groups` is the SDC's own
-  statement about which clocks are asynchronous. Clocks in the same `-group` are
-  related and their pairs are counted, not flagged; clocks in different groups
-  are asynchronous. With no grouping declared, every differently-named clock is
-  treated as asynchronous — the conservative reading.
+  statement about which clocks are asynchronous, read per command as a timer reads
+  it: two clocks are asynchronous when any one command puts them in different
+  groups (with or without `-allow_paths`), or is a single group holding one of them.
+  Clocks a command puts in one group, and no command separates, are related; their
+  pairs are counted, not flagged.
+- **Derived clocks are synchronous** — a generated clock and its master, or two
+  clocks generated from one, are one family (each master found as a timer finds it,
+  through the netlist when the SDC does not name it). Their pairs are timed, not
+  crossed, and are counted, unless a command separates them. With nothing declared,
+  every other pair of differently-named clocks is treated as asynchronous — the
+  conservative reading.
 - **Crossing detection** — for each capture flop, its data cone is walked back to
   the launching flops; any launch flop in a *different* domain is a crossing.
 - **Clock muxes** — a flop whose clock pin is reachable from more than one declared
