@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::liberty::{Dir, Lib};
 use crate::names::{split_bit_select, split_inst_pin};
 use crate::netlist::{Inst, Netlist};
-use crate::sdc::Sdc;
+use crate::sdc::{ClockGroups, Sdc};
 
 #[derive(Debug, Clone)]
 pub struct Crossing {
@@ -228,23 +228,29 @@ fn source_net<'a>(source: &str, nl: &'a Netlist) -> Option<&'a str> {
 
 /// Are two domains asynchronous to each other?
 ///
-/// `set_clock_groups` is the SDC's own statement about this: clocks inside one `-group` are
-/// related, clocks in different groups are not. Without it every differently-named clock is a
-/// crossing, which on a real SoC reports every synchronous divide off one PLL as a CDC
-/// violation — noise that gets a checker switched off.
+/// `set_clock_groups` is the SDC's own statement about this, read per COMMAND, as the timer
+/// reads it ([`vyges_loom::sdc::clocks_unrelated`]): two clocks are asynchronous when any one
+/// command puts them in different groups, or is a single group holding one of them. They are
+/// related when a command puts them in one group and no command separates them. Without either,
+/// every differently-named clock is a crossing; that is noisy on a real SoC, but it is the
+/// conservative reading.
 ///
-/// A clock the grouping never mentions is unconstrained, and is treated as asynchronous: the
-/// conservative reading, and the one that keeps an SDC declaring nothing behaving exactly as
-/// before.
-fn asynchronous(a: &str, b: &str, groups: &[Vec<String>]) -> bool {
+/// For CDC, `-asynchronous -allow_paths` separates too: the timer still times those paths, but
+/// the clocks are declared asynchronous and each crossing needs a synchronizer.
+///
+/// ⛔ The groups of all commands were once merged into one list and a clock looked up in the
+/// first group naming it. A file that groups `{a b}` in one command and separates `a` from `b`
+/// in another then read `a` and `b` as related, and the crossing was never reported.
+fn asynchronous(a: &str, b: &str, groups: &[ClockGroups]) -> bool {
     if a == b {
         return false;
     }
-    let group_of = |c: &str| groups.iter().position(|g| g.iter().any(|n| n == c));
-    match (group_of(a), group_of(b)) {
-        (Some(x), Some(y)) => x != y,
-        _ => true,
+    let declared: Vec<ClockGroups> = groups.iter().map(|g| ClockGroups { allow_paths: false, ..g.clone() }).collect();
+    if vyges_loom::sdc::clocks_unrelated(&declared, a, b) {
+        return true;
     }
+    let together = groups.iter().any(|g| g.groups.iter().any(|grp| grp.iter().any(|n| n == a) && grp.iter().any(|n| n == b)));
+    !together
 }
 
 /// Group synchronized crossings into the buses they belong to.
@@ -394,7 +400,7 @@ pub fn analyze(nl: &Netlist, lib: &Lib, sdc: &Sdc) -> Result<CdcReport, String> 
                         if dl == dc {
                             continue; // same domain, not a crossing
                         }
-                        if !asynchronous(dl, dc, &sdc.async_groups) {
+                        if !asynchronous(dl, dc, &sdc.clock_groups) {
                             related_skipped += 1; // declared related: timed, not crossed
                             continue;
                         }
@@ -611,6 +617,33 @@ mod tests {
         let r = analyze(&nl, &lib(), &one).unwrap();
         assert!(r.crossings.is_empty(), "all three are declared related");
         assert_eq!(r.related_skipped, 2);
+    }
+
+    /// Clock groups read per command, as the timer reads them: a command that separates two
+    /// clocks makes them asynchronous even when another puts them in one group; `-allow_paths`
+    /// still declares them asynchronous (the timer times the paths; CDC still needs a
+    /// synchronizer).
+    #[test]
+    fn a_command_that_separates_two_clocks_makes_a_crossing() {
+        let nl = crate::netlist::parse(
+            "module t(clk1,clk2,d,y);\ninput clk1,clk2,d; output y;\nwire q;\n\
+             DFF a(.CK(clk1),.D(d),.Q(q));\nDFF b(.CK(clk2),.D(q),.Q(y));\nendmodule\n",
+        )
+        .unwrap();
+        let two = "create_clock -name clk1 -period 10 [get_ports clk1]\n\
+                   create_clock -name clk2 -period 7 [get_ports clk2]\n";
+        let crossings = |extra: &str| analyze(&nl, &lib(), &Sdc::parse(&format!("{two}{extra}")).unwrap()).unwrap().crossings.len();
+        assert_eq!(crossings("set_clock_groups -asynchronous -group {clk1 clk2}\n"), 0, "related");
+        assert_eq!(
+            crossings("set_clock_groups -asynchronous -group {clk1 clk2}\nset_clock_groups -asynchronous -group clk1 -group clk2\n"),
+            1,
+            "the second command separates them"
+        );
+        assert_eq!(
+            crossings("set_clock_groups -asynchronous -group {clk1 clk2}\nset_clock_groups -asynchronous -allow_paths -group clk1 -group clk2\n"),
+            1,
+            "-allow_paths declares them asynchronous though another command groups them"
+        );
     }
 
     /// Two bits of one bus, each with its own clean 2-flop synchronizer.
