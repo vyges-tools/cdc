@@ -160,6 +160,34 @@ fn emit_waive_events(o: &waive::WaiveOutcome, set: &waive::WaiverSet) {
     }
 }
 
+/// A crossing's setup fate, in words.
+fn fate_text(f: &vyges_loom::sdc_path_fate::Fate) -> String {
+    use vyges_loom::sdc_path_fate::Fate;
+    match f {
+        Fate::ClockGroups(g) => format!("untimed: {g}"),
+        Fate::FalsePath(t) => format!("untimed: {t}"),
+        Fate::MaxDelay(v, t) => format!("timed: max delay {v} ({t})"),
+        Fate::Multicycle(n, t) => format!("timed: multicycle {n} ({t})"),
+        Fate::ClockEdges => "timed: against the clocks' edges (the SDC says nothing about it)".to_string(),
+        Fate::Undecided(why) => format!("not decided: {why}"),
+    }
+}
+
+/// A JSON string literal.
+fn jstr(s: &str) -> String {
+    let mut o = String::from("\"");
+    for ch in s.chars() {
+        match ch {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
 fn render_text(r: &CdcReport) -> String {
     let mut s = String::new();
     let unsync = r.crossings.iter().filter(|c| !c.synchronized).count();
@@ -260,6 +288,18 @@ fn render_text(r: &CdcReport) -> String {
             r.synchronous_skipped
         ));
     }
+    if !r.crossings.is_empty() {
+        let count = |t: Option<bool>| r.crossings.iter().filter(|c| c.setup.timed() == t).count();
+        let edges = r.crossings.iter().filter(|c| c.setup == vyges_loom::sdc_path_fate::Fate::ClockEdges).count();
+        s.push_str(&format!(
+            "  timing (setup, as the timer decides it): {} untimed, {} timed ({} of them against the \
+             clocks' edges only), {} not decided\n",
+            count(Some(false)),
+            count(Some(true)),
+            edges,
+            count(None)
+        ));
+    }
     if r.crossings.is_empty() {
         // Which kind of nothing this is. Three of them are distinguishable and they mean very
         // different things to the person reading a passing run.
@@ -283,8 +323,13 @@ fn render_text(r: &CdcReport) -> String {
             "VIOL (no synchronizer)"
         };
         s.push_str(&format!(
-            "  {} [{}] → {} [{}]   {}\n",
-            c.from_flop, c.from_domain, c.to_flop, c.to_domain, tag
+            "  {} [{}] → {} [{}]   {}   {}\n",
+            c.from_flop,
+            c.from_domain,
+            c.to_flop,
+            c.to_domain,
+            tag,
+            fate_text(&c.setup)
         ));
     }
     s
@@ -449,9 +494,13 @@ fn render_json(r: &CdcReport, o: &waive::WaiveOutcome) -> String {
     s.push_str("  \"items\": [\n");
     for (i, c) in r.crossings.iter().enumerate() {
         let comma = if i + 1 < r.crossings.len() { "," } else { "" };
+        let timed = match c.setup.timed() {
+            Some(t) => t.to_string(),
+            None => "null".to_string(),
+        };
         s.push_str(&format!(
-            "    {{\"from\": \"{}\", \"to\": \"{}\", \"from_domain\": \"{}\", \"to_domain\": \"{}\", \"synchronized\": {}, \"through_logic\": {}}}{}\n",
-            c.from_flop, c.to_flop, c.from_domain, c.to_domain, c.synchronized, c.through_logic, comma
+            "    {{\"from\": \"{}\", \"to\": \"{}\", \"from_domain\": \"{}\", \"to_domain\": \"{}\", \"synchronized\": {}, \"through_logic\": {}, \"setup_timed\": {}, \"setup\": {}}}{}\n",
+            c.from_flop, c.to_flop, c.from_domain, c.to_domain, c.synchronized, c.through_logic, timed, jstr(&fate_text(&c.setup)), comma
         ));
     }
     s.push_str("  ]\n}\n");

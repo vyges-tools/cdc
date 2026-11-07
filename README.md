@@ -127,6 +127,14 @@ which cells are flops and which pins are clock / data / Q.
   conservative reading.
 - **Crossing detection** — for each capture flop, its data cone is walked back to
   the launching flops; any launch flop in a *different* domain is a crossing.
+- **Whether the timer times each crossing** — every crossing says what a timer does
+  with its setup check, decided by the timer's own rules: untimed (a separating
+  `set_clock_groups`, a false path), timed against a `set_max_delay` or a multicycle
+  that wins, or timed against the two clocks' edges because the SDC says nothing about
+  it, an edge relation two asynchronous clocks do not have. When an exception the check
+  cannot match could apply (a query, or a `-through` on a crossing through logic), the
+  crossing says "not decided" and why, rather than guess. The report counts each kind
+  (`setup_timed` per item in `--json`).
 - **Clock muxes** — a flop whose clock pin is reachable from more than one declared
   clock is analysed in **every** one of them, and listed in the report. Taking the
   first clock found would miss the other crossing and make the verdict depend on the

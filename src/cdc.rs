@@ -12,6 +12,7 @@ use crate::names::{split_bit_select, split_inst_pin};
 use crate::netlist::{Inst, Netlist};
 use crate::sdc::{ClockGroups, Sdc};
 use vyges_loom::sdc_clock_relations::Families;
+use vyges_loom::sdc_path_fate::{setup_fate, Fate, RegPath, Through};
 
 #[derive(Debug, Clone)]
 pub struct Crossing {
@@ -24,6 +25,12 @@ pub struct Crossing {
     pub through_logic: bool,
     /// Recognized as a clean two-flop synchronizer (direct Q→D, second stage present).
     pub synchronized: bool,
+    /// What the timer does with this path's setup check, as the reference decides it
+    /// ([`vyges_loom::sdc_path_fate`]): untimed (clock groups, a false path), timed against a max
+    /// delay, a multicycle or the clocks' edges, or not decided here. An asynchronous crossing
+    /// timed against the clocks' edges is checked against an edge relation the clocks do not
+    /// have: the SDC says nothing about it.
+    pub setup: Fate,
 }
 
 /// Bits of one bus crossing the same domain pair, **each through its own synchronizer**.
@@ -442,6 +449,7 @@ pub fn analyze(nl: &Netlist, lib: &Lib, sdc: &Sdc) -> Result<CdcReport, String> 
                         }
                         let synchronized =
                             direct && has_second_stage(inst, dc, lib, nl, &nd, &flop_domain);
+                        let setup = crossing_fate(sdc, nl, lib, li, inst, d, dn, direct, dl, dc);
                         crossings.push(Crossing {
                             from_flop: lname.clone(),
                             from_domain: dl.clone(),
@@ -449,6 +457,7 @@ pub fn analyze(nl: &Netlist, lib: &Lib, sdc: &Sdc) -> Result<CdcReport, String> 
                             to_domain: dc.clone(),
                             through_logic: !direct,
                             synchronized,
+                            setup,
                         });
                     }
                 }
@@ -471,6 +480,33 @@ pub fn analyze(nl: &Netlist, lib: &Lib, sdc: &Sdc) -> Result<CdcReport, String> 
         related_skipped,
         synchronous_skipped,
     })
+}
+
+/// The timer's fate for the setup check from launch flop `li` (clock `dl`) to `cap`'s data pin
+/// `d` (clock `dc`). A direct path passes exactly the launch output pin driving `dn`, the net
+/// `dn` and the data pin; one through logic passes pins this does not list.
+#[allow(clippy::too_many_arguments)]
+fn crossing_fate(sdc: &Sdc, nl: &Netlist, lib: &Lib, li: usize, cap: &Inst, d: &str, dn: &str, direct: bool, dl: &str, dc: &str) -> Fate {
+    let launch = &nl.insts[li];
+    let Some((clk, _, _)) = flop_pins(lib, &launch.cell) else {
+        return Fate::Undecided(format!("`{}` has no clock pin in the library", launch.name));
+    };
+    let through = direct.then(|| {
+        let outs = launch.conns.iter().filter(|(p, n)| n == dn && !is_in(lib, &launch.cell, p));
+        let mut pins: Vec<String> = outs.map(|(p, _)| format!("{}/{p}", launch.name)).collect();
+        pins.push(format!("{}/{d}", cap.name));
+        Through { pins, nets: vec![dn.to_string()] }
+    });
+    let path = RegPath {
+        launch_inst: &launch.name,
+        launch_clock_pin: &clk,
+        launch_clock: dl,
+        capture_inst: &cap.name,
+        capture_data_pin: d,
+        capture_clock: dc,
+        through,
+    };
+    setup_fate(sdc, &path)
 }
 
 /// Is the capture flop the first stage of a 2-flop synchronizer? — does its Q
@@ -681,6 +717,39 @@ mod tests {
             1,
             "-allow_paths declares them asynchronous though another command groups them"
         );
+    }
+
+    /// Each crossing says what the timer does with it (the reference's rules, witnessed by
+    /// `crossing-fate-probe.py`): untimed under a separating set_clock_groups, timed against a
+    /// max delay that wins, against the clocks' edges when the SDC says nothing, and untimed by
+    /// a false path through the crossing's own net. Through logic, a -through cannot be seen.
+    #[test]
+    fn each_crossing_says_whether_the_timer_times_it() {
+        let nl = crate::netlist::parse(
+            "module t(clk1,clk2,d,y,z);\ninput clk1,clk2,d; output y,z;\nwire q,q2,x;\n\
+             DFF a(.CK(clk1),.D(d),.Q(q));\nDFF b(.CK(clk2),.D(q),.Q(y));\n\
+             DFF a2(.CK(clk1),.D(d),.Q(q2));\nINV g(.A(q2),.Y(x));\nDFF b2(.CK(clk2),.D(x),.Q(z));\nendmodule\n",
+        )
+        .unwrap();
+        let two = "create_clock -name clk1 -period 10 [get_ports clk1]\n\
+                   create_clock -name clk2 -period 7 [get_ports clk2]\n";
+        let fates = |extra: &str| -> Vec<(String, Fate)> {
+            let r = analyze(&nl, &lib(), &Sdc::parse(&format!("{two}{extra}")).unwrap()).unwrap();
+            let mut v: Vec<(String, Fate)> = r.crossings.into_iter().map(|c| (c.to_flop, c.setup)).collect();
+            v.sort_by(|x, y| x.0.cmp(&y.0));
+            v
+        };
+        let only = |v: Vec<(String, Fate)>| -> Vec<Fate> { v.into_iter().map(|(_, f)| f).collect() };
+        assert_eq!(only(fates("")), [Fate::ClockEdges, Fate::ClockEdges]);
+        let g = only(fates("set_clock_groups -asynchronous -name io -group clk1 -group clk2\n"));
+        assert_eq!(g, vec![Fate::ClockGroups("set_clock_groups -asynchronous -name io".into()); 2]);
+        let d = only(fates("set_max_delay 4 -from [get_clocks clk1] -to [get_clocks clk2]\n"));
+        assert!(d.iter().all(|f| matches!(f, Fate::MaxDelay(v, _) if *v == 4.0)), "{d:?}");
+        let n = fates("set_false_path -through [get_nets q]\n");
+        assert!(matches!(n[0].1, Fate::FalsePath(_)), "b's path passes net q: {n:?}");
+        assert!(matches!(n[1].1, Fate::Undecided(_)), "b2's path is through logic: {n:?}");
+        let p = fates("set_false_path -through [get_pins a/Q]\n");
+        assert!(matches!(p[0].1, Fate::FalsePath(_)), "b's path passes a/Q: {p:?}");
     }
 
     /// A divide-by-2 off clk1 is clk1's family: a clk1 -> clk_div path is timed, not crossed,
