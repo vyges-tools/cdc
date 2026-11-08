@@ -104,7 +104,8 @@ which cells are flops and which pins are clock / data / Q.
 
 **At RTL.** With `--rtl`, the netlist is the elaborated RTL (`vyges physical syn synthesize`):
 each register is read by its RTL name, the net on its stored-value output, so crossings name
-registers as the RTL does (`ctrl.state[0]`, not `u12`) and an SDC written against the RTL (clock
+registers as the RTL does (`ctrl.state[0]`, not `u12`; a register whose output net is itself a
+port takes the port's name) and an SDC written against the RTL (clock
 groups, exceptions on registers) applies to the crossings as written. A register that cannot take
 its name keeps its instance name, with a `CDC-RTL-VIEW` warning saying why. The gate-level run is
 unchanged.
