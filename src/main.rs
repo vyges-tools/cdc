@@ -17,7 +17,8 @@ const USAGE: &str = "\
 vyges loom cdc — structural clock- and reset-domain-crossing checks
 
 usage:
-  vyges loom cdc check NETLIST --lib L.lib --sdc S.sdc [--rtl] [-o OUT] [--json] [--fail-on-violation]
+  vyges loom cdc check NETLIST --lib L.lib --sdc S.sdc [--rtl [--ranges R.json]] [-o OUT] [--json]
+                       [--fail-on-violation]
   vyges loom cdc rdc   NETLIST --lib L.lib           [--rtl] [-o OUT] [--json] [--fail-on-violation]
 
 `check` finds CLOCK-domain crossings; `rdc` finds RESET-domain crossings — a flop
@@ -32,7 +33,14 @@ flags:
                         register is read by its RTL name, the net on its stored-value output, so
                         crossings name registers as the RTL does and an SDC written against the
                         RTL applies as written. A register that cannot take its name keeps its
-                        instance name, with a warning
+                        instance name, with a warning. The SDC's names are read as `vyges physical
+                        sdc map` reads them, by the same code: an RTL form of a register name
+                        (`cnt_reg[0]`, `a/b`) by its alias, each reported (CDC-MAP-ALIAS); an
+                        ambiguous alias is reported (CDC-MAP-UNKNOWN), never guessed
+  --ranges FILE         with --rtl (`check`): each vector's declared range (`vyges physical syn
+                        sv-ranges`); an RTL bit index in the SDC (`r[8]` of [11:8]) is read as the
+                        elaborated one (`r[0]`), reported (CDC-MAP-BIT); one outside its range is
+                        reported (CDC-MAP-UNKNOWN) and read as written
   -o FILE               write the report to FILE (default: stdout)
   --json                machine-readable JSON instead of text
   --fail-on-violation   exit 3 if any unsynchronized crossing is found (CI gate)
@@ -657,7 +665,8 @@ pub fn main() {
     "args_template": ["check", "{netlist}", "--lib", "{lib}", "--sdc", "{sdc}"],
     "optional": [
       { "arg": "out", "flag": "-o" },
-      { "arg": "rtl", "flag": "--rtl" }
+      { "arg": "rtl", "flag": "--rtl" },
+      { "arg": "ranges", "flag": "--ranges" }
     ],
     "emits_json": true
   },
@@ -669,7 +678,8 @@ pub fn main() {
       "lib": { "type": "string", "description": "Liberty file identifying flops and clock/data pins" },
       "sdc": { "type": "string", "description": "SDC file defining clock domains" },
       "out": { "type": "string", "description": "write the report to this file instead of stdout" },
-      "rtl": { "type": "boolean", "description": "the netlist is the elaborated RTL: read registers by their RTL names, so an RTL SDC applies" }
+      "rtl": { "type": "boolean", "description": "the netlist is the elaborated RTL: read registers by their RTL names, so an RTL SDC applies" },
+      "ranges": { "type": "string", "description": "with rtl: declared vector ranges (syn sv-ranges); the SDC's RTL bit indices are read as the elaborated ones" }
     }
   },
   "artifacts": [ { "role": "cdc_report", "field": "report_path" } ],
@@ -711,9 +721,21 @@ pub fn main() {
         exit(2);
     }
 
+    let rtl = args.iter().any(|a| a == "--rtl");
+    if opt(&args, "--ranges").is_some() && (!rtl || reset_mode) {
+        eprintln!("error: --ranges is read with --rtl, by `check` (it reads the SDC's bit indices)\n{USAGE}");
+        exit(2);
+    }
     let nl = netlist::load(net).unwrap_or_else(|e| die(&format!("{net}: {e}")));
     let lib = Lib::load(&libp).unwrap_or_else(|e| die(&format!("{libp}: {e}")));
-    let nl = if args.iter().any(|a| a == "--rtl") { rtl_view(nl, &lib, net) } else { nl };
+    // `--rtl`: the SDC is read by the RTL naming of the netlist as elaborated
+    let naming = rtl.then(|| {
+        let ranges = opt(&args, "--ranges")
+            .map(|p| vyges_loom::sdc_rtl_map::load_ranges(&p).unwrap_or_else(|e| die(&e)))
+            .unwrap_or_default();
+        vyges_loom::sdc_rtl_map::RtlNaming::new(&nl, &lib, ranges)
+    });
+    let nl = if rtl { rtl_view(nl, &lib, net) } else { nl };
 
     let json = args.iter().any(|a| a == "--json");
     let waivers = match opt(&args, "--waivers") {
@@ -745,7 +767,10 @@ pub fn main() {
         (t, n, 0usize)
     } else {
         let sdcp = opt(&args, "--sdc").expect("checked above");
-        let sdc = Sdc::load(&sdcp).unwrap_or_else(|e| die(&format!("{sdcp}: {e}")));
+        let sdc = match naming {
+            Some(naming) => load_rtl_sdc(&sdcp, &nl, &lib, naming),
+            None => Sdc::load(&sdcp).unwrap_or_else(|e| die(&format!("{sdcp}: {e}"))),
+        };
         let mut report = cdc::analyze(&nl, &lib, &sdc).unwrap_or_else(|e| die(&e));
         let outcome = waive::apply(&mut report, &waivers, as_of);
         emit_cdc_events(&report);
@@ -786,6 +811,22 @@ pub fn main() {
     {
         exit(3);
     }
+}
+
+/// `--rtl`: the SDC read against the RTL view, each object pattern by the RTL naming (loom
+/// `sdc_rtl_map::RtlNaming`, the reading `vyges physical sdc map` uses), and each name it read
+/// differently from how it is written reported as `map` reports it (`read_notes`).
+fn load_rtl_sdc(path: &str, nl: &netlist::Netlist, lib: &Lib, naming: vyges_loom::sdc_rtl_map::RtlNaming) -> Sdc {
+    use vyges_events::{emit, Event, Severity};
+    let mut d = vyges_loom::sdc::SdcDesign::from_netlist(nl, Some(lib));
+    d.rtl = Some(naming);
+    let sdc = Sdc::load_with(path, &d).unwrap_or_else(|e| die(&format!("{path}: {e}")));
+    let log = d.rtl.as_ref().map(|r| r.log.borrow().clone()).unwrap_or_default();
+    for n in vyges_loom::sdc_rtl_map::read_notes(&log) {
+        let sev = if n.warn { Severity::Warn } else { Severity::Info };
+        emit(&Event::new("vyges-cdc", sev, format!("{path}: {}", n.message)).with_code(format!("CDC-MAP-{}", n.kind)));
+    }
+    sdc
 }
 
 /// `--rtl`: the elaborated netlist read by RTL register names: each register instance renamed to

@@ -58,3 +58,49 @@ fn rtl_names_the_crossing_and_applies_the_rtl_sdc() {
     assert!(out.contains("\"setup_timed\": false"), "{out}");
     assert!(err.contains("RTL view: 2 register(s) named by their RTL name, 0 kept"), "{err}");
 }
+
+/// `--rtl` reads the SDC's names as `vyges physical sdc map` does, by the same loom code: an RTL
+/// form of a register name by its alias (`b_q_reg` is `b_q`), and with `--ranges` a declared bit
+/// index (`a_q_reg[8]` of [9:8] is `a_q[0]`), each reported (CDC-MAP-ALIAS, CDC-MAP-BIT). Without
+/// the ranges, `a_q[8]` names nothing and the false path does not cover the crossing.
+#[test]
+fn rtl_reads_sdc_bit_indices_and_aliases_as_map_does() {
+    let dir = std::env::temp_dir().join(format!("vyges-cdc-rtl-names-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("t.lib"), LIB).unwrap();
+    std::fs::write(
+        dir.join("t.v"),
+        "module t(ca, cb, d, y);\ninput ca, cb, d; output y;\nwire [1:0] a_q; wire b_q;\n\
+         dff u1(.CK(ca), .D(d), .Q(a_q[0]));\ndff u2(.CK(ca), .D(d), .Q(a_q[1]));\n\
+         dff u3(.CK(cb), .D(a_q[0]), .Q(b_q));\nbuf u4(.A(b_q), .X(y));\nendmodule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("t.sdc"),
+        "create_clock -name ca -period 10 [get_ports ca]\n\
+         create_clock -name cb -period 7 [get_ports cb]\n\
+         set_false_path -from [get_cells {a_q_reg[8]}] -to [get_cells b_q_reg]\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("r.json"), r#"{ "ranges": { "a_q": [9, 8] } }"#).unwrap();
+    let run = |extra: &[&str]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_vyges-cdc"))
+            .arg("check").arg(dir.join("t.v")).arg("--lib").arg(dir.join("t.lib")).arg("--sdc").arg(dir.join("t.sdc")).arg("--json")
+            .args(extra)
+            .output()
+            .expect("run vyges-cdc");
+        (o.status.code(), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned())
+    };
+    let ranges = dir.join("r.json");
+    let ranges = ranges.to_str().unwrap();
+    let (_, out, err) = run(&["--rtl", "--ranges", ranges]);
+    assert!(out.contains("\"from\": \"a_q[0]\", \"to\": \"b_q\""), "{out}{err}");
+    assert!(out.contains("\"setup_timed\": false"), "{out}{err}");
+    assert!(err.contains("get_cells a_q_reg[8] is elaborated a_q[0] (declared [9:8])") && err.contains("CDC-MAP-BIT"), "{err}");
+    assert!(err.contains("get_cells b_q_reg matched b_q by alias (reg-suffix)") && err.contains("CDC-MAP-ALIAS"), "{err}");
+    let (_, out, err) = run(&["--rtl"]);
+    assert!(out.contains("\"setup_timed\": true"), "without the ranges a_q[8] names nothing: {out}{err}");
+    assert!(!err.contains("CDC-MAP-BIT"), "{err}");
+    let (rc, _, err) = run(&["--ranges", ranges]);
+    assert_eq!(rc, Some(2), "--ranges without --rtl is refused: {err}");
+}

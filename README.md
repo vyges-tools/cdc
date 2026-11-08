@@ -95,7 +95,8 @@ vyges-cdc check design.v --lib cells.lib --sdc design.sdc --fail-on-violation  #
 vyges-cdc check design.v --lib cells.lib --sdc design.sdc --fail-on-multibit   # exit 3
 vyges-cdc check design.v --lib cells.lib --sdc design.sdc --waivers cdc-waivers.txt
 vyges-cdc check elab.v --lib cells.lib --sdc rtl.sdc --rtl     # the elaborated RTL
-# flags: --lib FILE · --sdc FILE · --rtl · -o FILE · --json · --fail-on-violation ·
+vyges-cdc check elab.v --lib cells.lib --sdc rtl.sdc --rtl --ranges ranges.json
+# flags: --lib FILE · --sdc FILE · --rtl · --ranges FILE · -o FILE · --json · --fail-on-violation ·
 #        --fail-on-multibit · --waivers FILE · --as-of YYYY-MM-DD · -h · -V
 ```
 
@@ -107,7 +108,13 @@ each register is read by its RTL name, the net on its stored-value output, so cr
 registers as the RTL does (`ctrl.state[0]`, not `u12`; a register whose output net is itself a
 port takes the port's name) and an SDC written against the RTL (clock
 groups, exceptions on registers) applies to the crossings as written. A register that cannot take
-its name keeps its instance name, with a `CDC-RTL-VIEW` warning saying why. The gate-level run is
+its name keeps its instance name, with a `CDC-RTL-VIEW` warning saying why. The SDC is then read
+against that view, and its names are read the way `vyges physical sdc map` reads them, by the same
+code: an RTL form of a register name by its alias (`cnt_reg[0]` is `cnt[0]`, `u_core/r` is
+`u_core.r`), and with `--ranges` (from `vyges physical syn sv-ranges`) a declared bit index as the
+elaborated one (`cnt[9]` of `[9:8]` is `cnt[1]`). Each is reported (`CDC-MAP-ALIAS`,
+`CDC-MAP-BIT`). An alias two registers could both mean, or an index outside its declared range, is
+reported (`CDC-MAP-UNKNOWN`) and read as written, never guessed. The gate-level run is
 unchanged.
 
 ## How it works
