@@ -94,12 +94,20 @@ vyges-cdc check design.v --lib cells.lib --sdc design.sdc --json
 vyges-cdc check design.v --lib cells.lib --sdc design.sdc --fail-on-violation  # exit 3
 vyges-cdc check design.v --lib cells.lib --sdc design.sdc --fail-on-multibit   # exit 3
 vyges-cdc check design.v --lib cells.lib --sdc design.sdc --waivers cdc-waivers.txt
-# flags: --lib FILE · --sdc FILE · -o FILE · --json · --fail-on-violation ·
+vyges-cdc check elab.v --lib cells.lib --sdc rtl.sdc --rtl     # the elaborated RTL
+# flags: --lib FILE · --sdc FILE · --rtl · -o FILE · --json · --fail-on-violation ·
 #        --fail-on-multibit · --waivers FILE · --as-of YYYY-MM-DD · -h · -V
 ```
 
 Each **`create_clock`** in the SDC is a clock domain. The Liberty tells the engine
 which cells are flops and which pins are clock / data / Q.
+
+**At RTL.** With `--rtl`, the netlist is the elaborated RTL (`vyges physical syn synthesize`):
+each register is read by its RTL name, the net on its stored-value output, so crossings name
+registers as the RTL does (`ctrl.state[0]`, not `u12`) and an SDC written against the RTL (clock
+groups, exceptions on registers) applies to the crossings as written. A register that cannot take
+its name keeps its instance name, with a `CDC-RTL-VIEW` warning saying why. The gate-level run is
+unchanged.
 
 ## How it works
 

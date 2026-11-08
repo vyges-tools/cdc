@@ -17,8 +17,8 @@ const USAGE: &str = "\
 vyges loom cdc — structural clock- and reset-domain-crossing checks
 
 usage:
-  vyges loom cdc check NETLIST --lib L.lib --sdc S.sdc [-o OUT] [--json] [--fail-on-violation]
-  vyges loom cdc rdc   NETLIST --lib L.lib           [-o OUT] [--json] [--fail-on-violation]
+  vyges loom cdc check NETLIST --lib L.lib --sdc S.sdc [--rtl] [-o OUT] [--json] [--fail-on-violation]
+  vyges loom cdc rdc   NETLIST --lib L.lib           [--rtl] [-o OUT] [--json] [--fail-on-violation]
 
 `check` finds CLOCK-domain crossings; `rdc` finds RESET-domain crossings — a flop
 asynchronously reset by one reset feeding a flop reset by another. A single-clock design is
@@ -28,6 +28,11 @@ no SDC: reset domains are structural, traced from the Liberty ff group's clear/p
 flags:
   --lib FILE            Liberty (identifies flops + clock/data/reset pins) — required
   --sdc FILE            SDC clock definitions (the domains) — required by `check`
+  --rtl                 the netlist is the elaborated RTL (`vyges physical syn synthesize`): each
+                        register is read by its RTL name, the net on its stored-value output, so
+                        crossings name registers as the RTL does and an SDC written against the
+                        RTL applies as written. A register that cannot take its name keeps its
+                        instance name, with a warning
   -o FILE               write the report to FILE (default: stdout)
   --json                machine-readable JSON instead of text
   --fail-on-violation   exit 3 if any unsynchronized crossing is found (CI gate)
@@ -651,7 +656,8 @@ pub fn main() {
   "invocation": {
     "args_template": ["check", "{netlist}", "--lib", "{lib}", "--sdc", "{sdc}"],
     "optional": [
-      { "arg": "out", "flag": "-o" }
+      { "arg": "out", "flag": "-o" },
+      { "arg": "rtl", "flag": "--rtl" }
     ],
     "emits_json": true
   },
@@ -662,7 +668,8 @@ pub fn main() {
       "netlist": { "type": "string", "description": "gate-level netlist to analyze" },
       "lib": { "type": "string", "description": "Liberty file identifying flops and clock/data pins" },
       "sdc": { "type": "string", "description": "SDC file defining clock domains" },
-      "out": { "type": "string", "description": "write the report to this file instead of stdout" }
+      "out": { "type": "string", "description": "write the report to this file instead of stdout" },
+      "rtl": { "type": "boolean", "description": "the netlist is the elaborated RTL: read registers by their RTL names, so an RTL SDC applies" }
     }
   },
   "artifacts": [ { "role": "cdc_report", "field": "report_path" } ],
@@ -706,6 +713,7 @@ pub fn main() {
 
     let nl = netlist::load(net).unwrap_or_else(|e| die(&format!("{net}: {e}")));
     let lib = Lib::load(&libp).unwrap_or_else(|e| die(&format!("{libp}: {e}")));
+    let nl = if args.iter().any(|a| a == "--rtl") { rtl_view(nl, &lib, net) } else { nl };
 
     let json = args.iter().any(|a| a == "--json");
     let waivers = match opt(&args, "--waivers") {
@@ -778,6 +786,31 @@ pub fn main() {
     {
         exit(3);
     }
+}
+
+/// `--rtl`: the elaborated netlist read by RTL register names: each register instance renamed to
+/// the net on its stored-value output, where a front end that keeps RTL names puts the register
+/// name (loom `sdc_rtl_map::rtl_view`). Crossings then name registers as the RTL does, and an SDC
+/// written against the RTL (clock groups, exceptions on registers) applies as written. A register
+/// that cannot take its name keeps its instance name, with a warning saying why.
+fn rtl_view(nl: netlist::Netlist, lib: &Lib, path: &str) -> netlist::Netlist {
+    use vyges_events::{emit, Event, Severity};
+    let v = vyges_loom::sdc_rtl_map::rtl_view(&nl, lib);
+    for (inst, why) in &v.kept {
+        emit(
+            &Event::new("vyges-cdc", Severity::Warn, format!("{path}: register {inst} keeps its instance name: {why}"))
+                .with_code("CDC-RTL-VIEW"),
+        );
+    }
+    emit(
+        &Event::new(
+            "vyges-cdc",
+            Severity::Info,
+            format!("{path}: RTL view: {} register(s) named by their RTL name, {} kept their instance name", v.renamed, v.kept.len()),
+        )
+        .with_code("CDC-RTL-VIEW"),
+    );
+    v.netlist
 }
 
 fn die(msg: &str) -> ! {
