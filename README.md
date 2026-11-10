@@ -1,5 +1,7 @@
 # vyges-cdc
 
+**[Download Loom](https://vyges.com/products/vyges-cli/#install)** · install the free [Vyges CLI](https://vyges.com/products/vyges-cli/), then `vyges install loom`
+
 Structural **clock-domain-crossing** check: a gate-level netlist, a Liberty, and
 the clock definitions in — the list of domain crossings out, each flagged
 synchronized or not.
